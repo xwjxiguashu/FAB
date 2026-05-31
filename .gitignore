@@ -1,0 +1,37 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+
+# Virtual environments
+.venv/
+venv/
+env/
+
+# Local Claude settings
+.claude/
+.worktrees/
+
+# Generated scheduler outputs
+small_outputs/
+medium_outputs/
+large_outputs/
+large_outputs_stochastic_vns/
+
+# OS/editor
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
+
+# Vendored / extracted assets
+.codex_deps/
+.codex_pdf_text/
+
+# Generated scheduler outputs (FABenv)
+FAB_RL/FABenv/pressure_outputs/
