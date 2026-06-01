@@ -35,3 +35,7 @@ Thumbs.db
 
 # Generated scheduler outputs (FABenv)
 FAB_RL/FABenv/pressure_outputs/
+
+# Trained model checkpoints & evaluation artifacts (generated, regenerable)
+*.pt
+FAB_RL/FABenv/*.jsonl

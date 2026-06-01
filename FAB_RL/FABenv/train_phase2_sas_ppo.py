@@ -187,7 +187,7 @@ def build_multihead_training_components(top_k=8, hidden_dim=128, learning_rate=3
     }
 
 
-def _run_training(components, num_episodes, mode, episode_logger=None):
+def _run_training(components, num_episodes, mode, episode_logger=None, on_episode=None):
     if mode == "small" or mode == "pressure":
         return components["trainer"].train(
             components["driver"],
@@ -200,6 +200,7 @@ def _run_training(components, num_episodes, mode, episode_logger=None):
             num_episodes=num_episodes,
             episode_logger=episode_logger,
             reward_vector_config=components["reward_vector_config"],
+            on_episode=on_episode,
         )
     if mode == "random":
         driver_factory = build_curriculum_driver_factory(
@@ -216,11 +217,96 @@ def _run_training(components, num_episodes, mode, episode_logger=None):
     raise ValueError("mode must be 'small', 'random', 'pressure', or 'multihead'")
 
 
+def _run_multihead_parallel(components, num_episodes, n_workers, encoder_kind,
+                            episode_logger=None, on_episode=None,
+                            process_noise_enabled=False, noise_seed_base=0):
+    """多进程并行 multihead 训练 (报告 §7.1 多 worker 扩展)。
+
+    每个 iter: 广播权重 → N 个 worker 各跑 1 个 episode → steps 顺序拼进一个 buffer
+    (GAE 在 done 处自动归零，跨 episode 不串味) → 一次 PPO 更新 → λ 对偶上升用
+    **N 个 episode 的平均违规率** (Ê[violation] 估计更稳，正是报告 §3.3 想要的)。
+    """
+    import math
+
+    from phase2_ppo_buffer import MultiHeadRolloutBuffer
+    from parallel_rollout import ParallelRolloutCollector, make_spec
+
+    trainer = components["trainer"]
+    policy = components["policy"]
+    channels = tuple(components["channels"])
+    spec = make_spec(
+        encoder_kind=encoder_kind,
+        candidate_dim=components["candidate_dim"],
+        global_dim=components["global_dim"],
+        hidden_dim=components["hidden_dim"],
+        channels=channels,
+        top_k=int(getattr(components["env"], "top_k", 8)),
+        process_noise_enabled=process_noise_enabled,
+        noise_seed_base=noise_seed_base,
+    )
+    import time as _time
+
+    n_iters = max(1, math.ceil(int(num_episodes) / int(n_workers)))
+    history = []
+    episode_idx = 0
+    _t_pool = _time.time()
+    with ParallelRolloutCollector(n_workers, spec) as collector:
+        print(f"[parallel] pool ready in {_time.time()-_t_pool:.1f}s", flush=True)
+        for it in range(n_iters):
+            _t_it = _time.time()
+            results = collector.collect(policy.state_dict())
+            _collect_dt = _time.time() - _t_it
+            buffer = MultiHeadRolloutBuffer(
+                gamma=trainer.config.gamma, gae_lambda=trainer.config.gae_lambda,
+                channels=channels,
+            )
+            summaries = []
+            for steps, summary in results:
+                for s in steps:
+                    buffer.add(s)
+                summaries.append(summary)
+            if not buffer.steps:
+                continue
+            buffer.finish_episode(last_values={c: 0.0 for c in channels})
+            total_cost = trainer.episode_qtime_cost(buffer)
+            stats = trainer.update_policy(buffer)
+            trainer.update_lambda(total_cost / max(1, len(results)))  # 平均违规率
+
+            mean_reward = sum(float(s["episode_reward"]) for s in summaries) / len(summaries)
+            mean_completed = sum(float(s["completed_lots"]) for s in summaries) / len(summaries)
+            for summary in summaries:
+                row = {
+                    "episode": episode_idx, "iter": it,
+                    "episode_reward": float(summary["episode_reward"]),
+                    "completed_lots": int(summary["completed_lots"]),
+                    "termination_reason": summary["termination_reason"],
+                    **stats,
+                    "qtime_cost": float(total_cost / max(1, len(results))),
+                    "lambda_qtime": float(trainer.lambda_qtime),
+                }
+                history.append(row)
+                if episode_logger is not None:
+                    episode_logger.log(row)
+                episode_idx += 1
+            print(f"[parallel iter {it+1}/{n_iters}] {len(results)} eps  "
+                  f"collect={_collect_dt:.1f}s ({_collect_dt/max(1,len(results)):.1f}s/ep) "
+                  f"mean_reward={mean_reward:.3f} mean_completed={mean_completed:.1f} "
+                  f"loss={stats['policy_loss']:.4f} lambda={trainer.lambda_qtime:.4f}",
+                  flush=True)
+            if on_episode is not None:
+                on_episode(episode_idx - 1, history[-1])
+    return history
+
+
 def main(num_episodes=3, mode="small", tensorboard_logdir=None, save_path=None,
          use_qtime_lagrangian=False, qtime_cost_budget=0.0, qtime_lambda_lr=0.05,
-         device=None):
+         device=None, instance="small", save_every=0, parallel=0):
     if mode == "multihead":
+        mh_encoder_factory = (
+            build_pressure_test_encoder if instance == "pressure" else None
+        )
         components = build_multihead_training_components(
+            encoder_factory=mh_encoder_factory,
             use_qtime_lagrangian=use_qtime_lagrangian,
             qtime_cost_budget=qtime_cost_budget,
             qtime_lambda_lr=qtime_lambda_lr,
@@ -232,37 +318,52 @@ def main(num_episodes=3, mode="small", tensorboard_logdir=None, save_path=None,
         )
     else:
         components = build_training_components(device=device)
-    print(f"[train] mode={mode} device={components.get('device')} "
+    print(f"[train] mode={mode} instance={instance} device={components.get('device')} "
           f"(cuda_available={torch.cuda.is_available()})")
-    if tensorboard_logdir:
-        with TensorBoardTrainingLogger(tensorboard_logdir) as episode_logger:
-            history = _run_training(
-                components,
-                num_episodes,
-                mode,
-                episode_logger=episode_logger,
-            )
-    else:
-        history = _run_training(components, num_episodes, mode)
-    print(history)
-    if save_path:
-        from model_checkpoint import save_policy_checkpoint
 
+    def _save_checkpoint():
+        from model_checkpoint import save_policy_checkpoint
         policy_type = "multihead" if mode == "multihead" else "single"
         save_policy_checkpoint(
-            components["policy"],
-            save_path,
+            components["policy"], save_path,
             candidate_dim=components["candidate_dim"],
             global_dim=components["global_dim"],
             hidden_dim=components["hidden_dim"],
-            policy_type=policy_type,
-            channels=components.get("channels"),
-            metadata={
-                "mode": mode,
-                "num_episodes": int(num_episodes),
-                "top_k": int(getattr(components["env"], "top_k", 8)),
-            },
+            policy_type=policy_type, channels=components.get("channels"),
+            metadata={"mode": mode, "instance": instance,
+                      "num_episodes": int(num_episodes),
+                      "top_k": int(getattr(components["env"], "top_k", 8))},
         )
+
+    # 周期性保存：长训练被中断 (如 10 分钟工具上限) 仍留有最新模型。
+    on_episode = None
+    if save_path and save_every and int(save_every) > 0:
+        def on_episode(ep, row):
+            if (ep + 1) % int(save_every) == 0:
+                _save_checkpoint()
+                print(f"[ckpt] saved at episode {ep + 1}: util/q via history; "
+                      f"util_row={row.get('episode_reward'):.3f}", flush=True)
+
+    use_parallel = mode == "multihead" and int(parallel) > 1
+
+    def _run(episode_logger=None):
+        if use_parallel:
+            print(f"[parallel] {parallel} worker 进程 (CPU env) 并行采集", flush=True)
+            return _run_multihead_parallel(
+                components, num_episodes, int(parallel), instance,
+                episode_logger=episode_logger, on_episode=on_episode,
+            )
+        return _run_training(components, num_episodes, mode,
+                             episode_logger=episode_logger, on_episode=on_episode)
+
+    if tensorboard_logdir:
+        with TensorBoardTrainingLogger(tensorboard_logdir) as episode_logger:
+            history = _run(episode_logger=episode_logger)
+    else:
+        history = _run()
+    print(history[-3:] if len(history) > 3 else history)
+    if save_path:
+        _save_checkpoint()
         print(f"Saved policy checkpoint to: {save_path}")
     return history
 
@@ -303,6 +404,18 @@ def _parse_args():
         "--device", choices=["auto", "cpu", "cuda"], default="auto",
         help="训练设备：auto=有显卡用 CUDA 否则 CPU；cuda=强制 GPU；cpu=强制 CPU",
     )
+    parser.add_argument(
+        "--instance", choices=["small", "pressure"], default="small",
+        help="(multihead only) 训练实例：small(4 lots) 或 pressure(50 lots)",
+    )
+    parser.add_argument(
+        "--save-every", type=int, default=0,
+        help="每 N 个 episode 保存一次检查点 (需配合 --save-path)；长训练被中断时留有最新模型",
+    )
+    parser.add_argument(
+        "--parallel", type=int, default=0,
+        help="(multihead only) 多进程并行环境的 worker 数 (>1 启用)；用多核 CPU 加速采集",
+    )
     return parser.parse_args()
 
 
@@ -317,4 +430,7 @@ if __name__ == "__main__":
         qtime_cost_budget=args.qtime_budget,
         qtime_lambda_lr=args.qtime_lambda_lr,
         device=args.device,
+        instance=args.instance,
+        save_every=args.save_every,
+        parallel=args.parallel,
     )

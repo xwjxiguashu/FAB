@@ -215,9 +215,17 @@ class Phase1CalendarProblem(ProblemDefinitionMixin, CalendarDecoderMixin):
         chamber_calendar = {}
         for row in lot_schedule:
             machine_calendar.setdefault(int(row[1]), []).append((float(row[3]), float(row[4])))
+        # 批处理 (报告 §1.5): 同一子批的多片 wafer 共享一个 (chamber,side) 区间，
+        # 故按 (resource, start, end) 去重，避免把"同批共享"误判为区间重叠。
+        chamber_seen = {}
         for row in wafer_schedule:
             resource_key = (int(row[2]), int(row[5]), int(row[6]))
-            chamber_calendar.setdefault(resource_key, []).append((float(row[7]), float(row[8])))
+            interval = (float(row[7]), float(row[8]))
+            seen = chamber_seen.setdefault(resource_key, set())
+            if interval in seen:
+                continue
+            seen.add(interval)
+            chamber_calendar.setdefault(resource_key, []).append(interval)
 
         for intervals in machine_calendar.values():
             intervals.sort()

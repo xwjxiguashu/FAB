@@ -1413,11 +1413,17 @@ class ResourceCalendarEnv:
             machine_calendar.setdefault(int(row[1]), []).append(
                 (float(row[3]), float(row[4]))
             )
+        # 批处理 (报告 §1.5): 同一子批的多片 wafer 共享一个 (chamber,side) 区间，
+        # 重建日历时按 (resource, start, end) 去重，避免把"同批共享"误计为冲突。
+        chamber_seen = {}
         for row in wafer_schedule:
             resource_key = (int(row[2]), int(row[5]), int(row[6]))
-            chamber_calendar.setdefault(resource_key, []).append(
-                (float(row[7]), float(row[8]))
-            )
+            interval = (float(row[7]), float(row[8]))
+            seen = chamber_seen.setdefault(resource_key, set())
+            if interval in seen:
+                continue
+            seen.add(interval)
+            chamber_calendar.setdefault(resource_key, []).append(interval)
 
         machine_conflicts = self._count_calendar_conflicts(machine_calendar)
         chamber_conflicts = self._count_calendar_conflicts(chamber_calendar)
@@ -1682,6 +1688,7 @@ class ResourceCalendarEnv:
         mc = self.state.machine_calendar
         cc = self.state.chamber_calendar
         wafer_count = int(self.encoder.wafer_counts[lot])
+        sub_batches = self._lot_sub_batches(lot)
         earliest_release = max(
             self.current_time,
             float(self.encoder.arrival_times[lot]),
@@ -1705,12 +1712,12 @@ class ResourceCalendarEnv:
                 infeasible = None
 
                 try:
-                    # 逐 Wafer, 逐 Stage 分配腔体资源
-                    for _wafer_id in range(1, wafer_count + 1):
-                        wafer_current_time = lot_release_time
+                    # 按子批排程 (报告 §1.5 批处理): 整批占一个区间，逐阶段流水
+                    for batch_size in sub_batches:
+                        batch_current_time = lot_release_time
                         for stage in steps:
                             selected = self._select_earliest_stage_resource(
-                                machine, stage, wafer_current_time, cc,
+                                machine, stage, batch_current_time, cc,
                             )
                             if selected is None:
                                 infeasible = "chamber_side_unavailable"
@@ -1720,7 +1727,7 @@ class ResourceCalendarEnv:
                                 cc, resource_key, start_time, end_time,
                             )
                             iter_added.append((resource_key, start_time, end_time))
-                            wafer_current_time = end_time
+                            batch_current_time = end_time
                             lot_start_time = min(lot_start_time, start_time)
                             lot_end_time = max(lot_end_time, end_time)
                         if infeasible:
@@ -1778,6 +1785,19 @@ class ResourceCalendarEnv:
         if result is not None:
             return result, ""
         return None, reason
+
+    def _lot_sub_batches(self, lot):
+        """工件的子批切分 (报告 §1.5 批处理建模)。
+
+        N 片 wafer → ⌈N/side_capacity⌉ 个子批 (满批优先)。side_capacity 未设时
+        默认 = wafer_count (整批一批)，与下层估时器口径一致。返回每个子批的 wafer 数。
+        """
+        from lower_layer_estimator import compute_sub_batches
+        wafer_count = int(self.encoder.wafer_counts[int(lot)])
+        side_capacity = getattr(self.encoder, "side_capacity", None)
+        if side_capacity is None or int(side_capacity) <= 0:
+            side_capacity = wafer_count
+        return compute_sub_batches(wafer_count, int(side_capacity))
 
     def _allowed_resources_for(self, machine):
         """机台 m 声明允许的 (chamber, side) 集合，按 machine 缓存 (静态数据)。
@@ -2152,6 +2172,7 @@ class ResourceCalendarEnv:
         ppid = int(action.ppid)
         steps = self.encoder.get_process_steps(lot, machine, ppid)
         wafer_count = int(self.encoder.wafer_counts[lot])
+        sub_batches = self._lot_sub_batches(lot)
         earliest_release = max(
             self.current_time,
             float(self.encoder.arrival_times[lot]),
@@ -2171,12 +2192,19 @@ class ResourceCalendarEnv:
             lot_end_time = -np.inf
 
             try:
-                for wafer_id in range(1, wafer_count + 1):
-                    wafer_current_time = lot_release_time
+                # 按子批排程 (报告 §1.5 批处理): 子批内 wafer 同进同出、共享区间。
+                wafer_cursor = 0
+                for batch_size in sub_batches:
+                    batch_wafer_ids = list(
+                        range(wafer_cursor + 1, wafer_cursor + batch_size + 1)
+                    )
+                    wafer_cursor += batch_size
+                    batch_current_time = lot_release_time
 
                     for stage_id, stage in enumerate(steps, start=1):
                         # 噪声注入 (报告 §2.4.6): 仅在 commit 路径。规划用 μ，执行用实际值。
-                        # delta 必须在"找槽位"前采样并计入，否则拉长的区间会与后续重叠。
+                        # 整批一个实际时间 → 每 (子批, stage) 采样一次。
+                        # delta 必须在"找槽位"前计入，否则拉长的区间会与后续重叠。
                         process_time_delta = 0.0
                         if self.process_noise_enabled:
                             sigma = self._stage_process_sigma(
@@ -2190,7 +2218,7 @@ class ResourceCalendarEnv:
                         selected = self._select_earliest_stage_resource(
                             machine,
                             stage,
-                            wafer_current_time,
+                            batch_current_time,
                             chamber_calendar,
                             process_time_delta=process_time_delta,
                         )
@@ -2202,6 +2230,7 @@ class ResourceCalendarEnv:
                         resource_key, start_time, end_time = selected
                         _, chamber, side = resource_key
 
+                        # 整个子批占用一个区间 (只登记一次)
                         self.encoder.add_calendar_interval(
                             chamber_calendar,
                             resource_key,
@@ -2209,19 +2238,21 @@ class ResourceCalendarEnv:
                             end_time,
                         )
                         added_intervals.append((resource_key, start_time, end_time))
-                        wafer_current_time = end_time
+                        batch_current_time = end_time
                         lot_end_time = max(lot_end_time, end_time)
-                        trial_rows.append([
-                            lot,
-                            wafer_id,
-                            machine,
-                            ppid,
-                            stage_id,
-                            chamber,
-                            side,
-                            start_time,
-                            end_time,
-                        ])
+                        # 子批内每片 wafer 共享该区间，分别出一行
+                        for wafer_id in batch_wafer_ids:
+                            trial_rows.append([
+                                lot,
+                                wafer_id,
+                                machine,
+                                ppid,
+                                stage_id,
+                                chamber,
+                                side,
+                                start_time,
+                                end_time,
+                            ])
             except Exception:
                 self.encoder.rollback_calendar_intervals(
                     chamber_calendar,

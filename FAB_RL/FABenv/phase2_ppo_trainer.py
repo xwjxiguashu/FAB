@@ -609,8 +609,13 @@ class MultiHeadPPOTrainer:
                 }
         return stats
 
-    def train(self, driver, num_episodes, episode_logger=None, reward_vector_config=None):
-        """多头端到端训练循环。每 episode: reset → 收集 → GAE → update。"""
+    def train(self, driver, num_episodes, episode_logger=None, reward_vector_config=None,
+              on_episode=None):
+        """多头端到端训练循环。每 episode: reset → 收集 → GAE → update。
+
+        on_episode(episode_idx, row): 可选回调，每个 episode 结束后调用 —— 用于
+        进度打印与周期性保存检查点 (长训练被中断时仍留有最新模型)。
+        """
         history = []
         for episode in range(int(num_episodes)):
             driver.reset_episode()
@@ -639,4 +644,6 @@ class MultiHeadPPOTrainer:
             history.append(row)
             if episode_logger is not None:
                 episode_logger.log(row)
+            if on_episode is not None:
+                on_episode(episode, row)
         return history
