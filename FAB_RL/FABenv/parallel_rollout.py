@@ -66,6 +66,8 @@ def _init_worker(spec):
         w_lookahead=spec["w_lookahead"],
         process_noise_enabled=spec["process_noise_enabled"],
         noise_seed=noise_seed,
+        priority_filter_mode=spec.get("priority_filter_mode", "soft"),
+        priority_min_gap=spec.get("priority_min_gap", 0.0),
     )
     env.reset()
     obs_enc = Phase2ObservationEncoder(lookahead=spec["lookahead"])
@@ -98,7 +100,9 @@ def _run_episode(state_bytes):
     from phase2_ppo_buffer import MultiHeadRolloutBuffer
 
     policy = _WORKER["policy"]
-    policy.load_state_dict(torch.load(io.BytesIO(state_bytes), map_location="cpu"))
+    policy.load_state_dict(
+        torch.load(io.BytesIO(state_bytes), map_location="cpu", weights_only=True)
+    )
     driver = _WORKER["driver"]
     buf = MultiHeadRolloutBuffer(channels=_WORKER["channels"])
     driver.reset_episode()
@@ -151,7 +155,8 @@ class ParallelRolloutCollector:
 
 def make_spec(encoder_kind, candidate_dim, global_dim, hidden_dim=128,
               channels=MULTIHEAD_CHANNELS, top_k=8, lookahead=False, w_lookahead=0.0,
-              process_noise_enabled=False, noise_seed_base=0):
+              process_noise_enabled=False, noise_seed_base=0,
+              priority_filter_mode="soft", priority_min_gap=0.0):
     """构造 worker 初始化 spec (须全部可 pickle)。"""
     return {
         "encoder_kind": encoder_kind,
@@ -164,4 +169,6 @@ def make_spec(encoder_kind, candidate_dim, global_dim, hidden_dim=128,
         "w_lookahead": float(w_lookahead),
         "process_noise_enabled": bool(process_noise_enabled),
         "noise_seed_base": int(noise_seed_base),
+        "priority_filter_mode": str(priority_filter_mode),
+        "priority_min_gap": float(priority_min_gap),
     }

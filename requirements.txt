@@ -1,0 +1,22 @@
+# FAB_RL/FABenv 运行依赖
+# 安装:  python -m pip install -r requirements.txt
+# 测试/运行均从 FAB_RL/FABenv/ 目录执行 (包用裸 import，工作目录须在 sys.path 上)。
+
+numpy>=1.24,<2.0
+scipy>=1.10
+torch>=2.2
+pytest>=7.0
+
+# ---- 关于 torch 的 CPU / GPU 选择 ----
+# 上面的 torch 默认会装到 PyPI 的构建 (Linux 上通常是 CUDA 版，其它平台为 CPU 版)。
+# 代码用 resolve_device("auto") 自动选择：有 CUDA 显卡用 GPU，否则回退 CPU——
+# 所以无显卡的机器也能跑 (用 --device cpu 或 auto)。
+#
+# 想显式装某个构建：
+#   CPU 版:    pip install torch --index-url https://download.pytorch.org/whl/cpu
+#   CUDA 12.4: pip install torch --index-url https://download.pytorch.org/whl/cu124
+# 注意：本项目训练瓶颈是 CPU 环境仿真，GPU 提速有限；真正的加速来自
+#       --parallel N (多进程并行环境) 和已内置的 wafer 批处理。
+#
+# matplotlib 仅 Phase 1 甘特图 demo / 对应测试需要，核心训练/评测不依赖：
+# matplotlib>=3.5

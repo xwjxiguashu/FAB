@@ -108,6 +108,66 @@ def _run_list_schedule(sub_batches, stage_times, n_stages, instance_counts):
     return makespan, stage_end
 
 
+def schedule_deterministic(
+    sub_batches,
+    stage_times,
+    stage_resource_options,
+    machine,
+    instance_free_init,
+    lot_release_time=0.0,
+):
+    """Run deterministic list scheduling on absolute resource keys.
+
+    This is the shared lower-layer scheduling core. ``estimate`` calls it with
+    empty free times and ``schedule_on_calendar`` calls it with free times read
+    from the committed calendar.
+
+    Returns:
+        (lot_start, lot_end, batch_intervals), where each interval is
+        (batch_index, stage_index_1based, resource_key, start, end).
+    """
+    n_batches = len(sub_batches)
+    stage_times = np.asarray(stage_times, dtype=float)
+    if n_batches == 0:
+        return float(lot_release_time), float(lot_release_time), []
+    if stage_times.ndim != 2 or stage_times.shape[0] != n_batches:
+        raise ValueError("stage_times must have shape (n_batches, n_stages)")
+
+    n_stages = stage_times.shape[1]
+    if len(stage_resource_options) != n_stages:
+        raise ValueError("stage_resource_options length must equal n_stages")
+
+    machine = int(machine)
+    free = dict(instance_free_init or {})
+    intervals = []
+
+    for b in range(n_batches):
+        ready = float(lot_release_time)
+        for s in range(n_stages):
+            options = stage_resource_options[s]
+            if not options:
+                raise ValueError(f"stage {s + 1} has no resource options")
+
+            best_key = None
+            best_start = None
+            for chamber, side, _base_pt in options:
+                key = (machine, int(chamber), int(side))
+                cand_start = max(ready, float(free.get(key, 0.0)))
+                if best_start is None or cand_start < best_start:
+                    best_start = cand_start
+                    best_key = key
+
+            start = float(best_start)
+            end = start + float(stage_times[b, s])
+            free[best_key] = end
+            ready = end
+            intervals.append((b, s + 1, best_key, start, end))
+
+    lot_start = min(start for _b, _s, _key, start, _end in intervals)
+    lot_end = max(end for _b, _s, _key, _start, end in intervals)
+    return float(lot_start), float(lot_end), intervals
+
+
 # =============================================================================
 # 蒙特卡洛采样 → (μ_finish, σ_finish)
 # =============================================================================
@@ -325,30 +385,18 @@ def estimate(lot, machine, ppid, encoder, state, n_mc=50, rng=None, start_offset
     # ---- Step 6: 均值路径的 per_instance_occupancy (用于日历登记) ----
     # 用均值加工时间跑一次确定性排程，记录各资源区间
     mu_stage_times = np.tile(np.asarray(stage_mu), (n_batches, 1))
-    _, stage_end_per_batch = _run_list_schedule(
-        sub_batches, mu_stage_times, n_stages, instance_counts
+    _lot_start, _lot_end, occ_intervals = schedule_deterministic(
+        sub_batches,
+        mu_stage_times,
+        stage_resource_options,
+        machine,
+        instance_free_init={},
+        lot_release_time=0.0,
     )
-
-    # 重建各资源的占用区间 (简化: 顺序分配实例)
-    per_instance_occupancy = []
-    instance_free_mu = [
-        [0.0] * instance_counts[s]
-        for s in range(n_stages)
+    per_instance_occupancy = [
+        (resource_key, start, end)
+        for _b, _stage, resource_key, start, end in occ_intervals
     ]
-    for b in range(n_batches):
-        ready_time = 0.0
-        for s in range(n_stages):
-            best_instance = int(np.argmin(instance_free_mu[s]))
-            earliest_free = instance_free_mu[s][best_instance]
-            start = max(ready_time, earliest_free)
-            pt = float(stage_mu[s])
-            end = start + pt
-            instance_free_mu[s][best_instance] = end
-            ready_time = end
-            # resource_key: (machine, chamber, side)
-            ch, sd, _ = stage_resource_options[s][best_instance % len(stage_resource_options[s])]
-            resource_key = (machine, ch, sd)
-            per_instance_occupancy.append((resource_key, start, end))
 
     # ---- Step 7: 瓶颈阶段识别 ----
     # 瓶颈 = 有效吞吐最低的阶段: 实例数 × (1/μ_stage_time) 最小

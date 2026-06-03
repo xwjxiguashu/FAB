@@ -341,9 +341,9 @@ class MultiHeadPPOConfig:
         train_epochs: 每轮更新 epoch 数。
         minibatch_size: 小批次大小。
         max_grad_norm: 梯度裁剪范数上限。
-        w_exec/w_qtime/w_util/w_progress: 各通道优势权重 (均取正，
+        w_exec/w_qtime/w_util: 各通道优势权重 (均取正，
             r_qtime 奖励本身为负值，靠 reward 符号体现 cost，故统一加法)。
-        channels: 通道顺序 (固定 exec/qtime/util/progress)。
+        channels: 通道顺序 (固定 exec/qtime/util；progress 已删除)。
         use_qtime_lagrangian: 是否把 Q-time 残差约束改为 PPO-Lagrangian 自适应 λ
             (报告 §3.3)。True 时 qtime 通道权重由可学习的 λ 取代固定 w_qtime；
             False 时沿用固定 w_qtime (默认，基础版先跑通)。二者作用于同一 qtime
@@ -366,8 +366,7 @@ class MultiHeadPPOConfig:
     w_exec: float = 1.0
     w_qtime: float = 3.0
     w_util: float = 0.5
-    w_progress: float = 0.3
-    channels: tuple = ("exec", "qtime", "util", "progress")
+    channels: tuple = ("exec", "qtime", "util")
     # PPO-Lagrangian (报告 §3.3) — 默认关闭，沿用固定 w_qtime
     use_qtime_lagrangian: bool = False
     qtime_lambda_init: float = 0.0
@@ -383,8 +382,7 @@ class MultiHeadPPOConfig:
 def combine_channel_advantages(adv_dict, config, normalize=True):
     """逐通道归一化优势后加权求和 (报告 §4.7)。
 
-    A_t = w_exec·norm(Â_exec) + w_qtime·norm(Â_qtime)
-          + w_util·norm(Â_util) + w_progress·norm(Â_progress)
+    A_t = w_exec·norm(Â_exec) + w_qtime·norm(Â_qtime) + w_util·norm(Â_util)
 
     Args:
         adv_dict: {channel: np.ndarray(N,)} 各通道优势。
@@ -462,8 +460,8 @@ class MultiHeadPPOTrainer:
     def episode_qtime_cost(self, buffer):
         """从 buffer 提取本 episode 的期望 Q-time 违规率 (cost)。
 
-        qtime 通道终局奖励 r_qtime = -(violation_count / num_lots) ≤ 0
-        (仅末步非零)，故违规率 = -Σ_t reward_vector[qtime通道]。
+        qtime 通道为逐步奖励 r_qtime_t = -(new_violation_t / num_lots) ≤ 0
+        (Σ_t = 终局总违规率)，故违规率 = -Σ_t reward_vector[qtime通道]。
 
         Returns:
             违规率 (≥0)。buffer 为空时返回 0.0。

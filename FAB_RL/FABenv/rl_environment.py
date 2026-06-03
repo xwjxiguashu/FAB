@@ -341,31 +341,38 @@ def compute_sas_reward(info, config=None):
 
 @dataclass
 class RewardVectorConfig:
-    """向量奖励配置（报告 §4.5 R1，四通道）。
+    """向量奖励配置（报告 §4.5，三通道）。
 
-    四通道: exec(即时密集) + qtime(终局,硬约束残差=拖期) + util(终局,唯一软目标) + progress(终局,利用率代理)。
-    各通道独立，不跨通道求和。终局权重 w_* 作用在归一化 advantage 上（由 trainer 使用）。
+    三通道:
+      - exec  (即时密集): 成功插入基础奖励 + w_pack·packing_efficiency
+                          (packing = total_work/span，即"这次派工把机台时间用得多紧"，
+                          撞腔体争用→跨度变长→packing 变小，提供逐步可区分的利用率向信号)
+      - qtime (即时密集): -new_qtime_violation/num_lots，每步对"这次派工新造成的 Q-time 违反"
+                          直接惩罚（Σ_t = 终局总违反，telescoping，无双重计数，credit 更好）
+      - util  (终局):     avg_machine_utilization，唯一软目标
+    progress 通道已删除（恒为 1.0 的死重）。终局权重 w_* 作用在归一化 advantage 上（由 trainer 使用）。
     """
     insert_success_reward: float = 0.20
     insert_fail_penalty: float = -0.40
     mask_invalid_penalty: float = -0.50
+    w_pack: float = 0.10     # exec 通道的 packing(利用率向)信号强度
     w_exec: float = 1.0
     w_qtime: float = 3.0     # 大值，体现硬约束优先
     w_util: float = 0.5
-    w_progress: float = 0.3
-    channels: tuple = ("exec", "qtime", "util", "progress")
+    channels: tuple = ("exec", "qtime", "util")
 
 
 def compute_sas_reward_vector(info, config=None):
     """计算 SAS 向量奖励（报告 §4.5 R1）。
 
     Returns:
-        dict: {"reward_vector": np.array([4]), "r_exec", "r_qtime", "r_util", "r_progress"}
-        通道顺序: (exec, qtime, util, progress)
+        dict: {"reward_vector": np.array([3]), "r_exec", "r_qtime", "r_util"}
+        通道顺序: (exec, qtime, util)
     """
     if config is None:
         config = RewardVectorConfig()
 
+    # --- exec 通道（即时密集）：成功插入基础 + packing(利用率向边际质量) ---
     r_exec = 0.0
     if info.get("mask_invalid"):
         r_exec = config.mask_invalid_penalty
@@ -374,24 +381,28 @@ def compute_sas_reward_vector(info, config=None):
     elif info.get("insertion_failed"):
         r_exec = config.insert_fail_penalty
     elif info.get("insertion_success"):
-        r_exec = config.insert_success_reward
+        span = float(info.get("selected_lot_process_time", 0.0))
+        total_work = float(info.get("selected_lot_total_work", 0.0))
+        # packing = total_work/span ∈ 大致 1~N：撞腔体争用→span 拉长→packing 变小。
+        packing = (total_work / span) if span > 1e-9 else 0.0
+        r_exec = config.insert_success_reward + config.w_pack * packing
 
-    r_qtime = 0.0
+    # --- qtime 通道（即时密集）：逐步惩罚本次派工新造成的 Q-time 违反 ---
+    # new_qtime_violation 仅成功提交时非零；Σ_t = 终局总违反（telescoping，无双重计数）。
+    num_lots = max(float(info.get("num_lots", 1)), 1.0)
+    r_qtime = -float(info.get("new_qtime_violation", 0.0)) / num_lots
+
+    # --- util 通道（终局）：唯一软目标 ---
     r_util = 0.0
-    r_progress = 0.0
     if info.get("is_terminal"):
-        num_lots = max(float(info.get("num_lots", 1)), 1.0)
-        r_qtime = -float(info.get("qtime_violation_count", 0.0)) / num_lots
         r_util = float(info.get("avg_machine_utilization", 0.0))
-        r_progress = float(info.get("completed_lots", 0.0)) / num_lots
 
-    reward_vector = np.asarray([r_exec, r_qtime, r_util, r_progress], dtype=float)
+    reward_vector = np.asarray([r_exec, r_qtime, r_util], dtype=float)
     return {
         "reward_vector": reward_vector,
         "r_exec": float(r_exec),
         "r_qtime": float(r_qtime),
         "r_util": float(r_util),
-        "r_progress": float(r_progress),
     }
 
 
@@ -544,10 +555,6 @@ class ResourceCalendarEnv:
         # base 是 start_offset=0 的完成时间分布，只取决于静态输入（estimate 不读 state），
         # start_offset 在 estimate 内逐次重施，故跨步/跨机台可安全复用，仅 reset 时清空。
         self._estimate_cache = {}
-
-        # 机台允许资源集合缓存（静态，按 machine 键）：避免 _select_earliest_stage_resource
-        # 每次重建 setcomp（dry-run/commit 热点）。
-        self._allowed_resources_cache = {}
 
         self._sync_state_summary()
 
@@ -1663,16 +1670,12 @@ class ResourceCalendarEnv:
         return lot_recipe in allowed
 
     def _dry_run_candidate(self, lot, machine, ppid):
-        """对 (lot, machine, ppid) 组合执行 dry-run 试算。
+        """Build candidate features through the shared lower-layer scheduler."""
+        from lower_layer_scheduler import schedule_on_calendar
 
-        算法 (两层迭代):
-          1. 机台层: 找最早可用槽位 → 晶圆层: 逐 Wafer/Stage 分配腔体资源
-          2. 若腔体层产生的 lot_duration 使机台槽位不匹配 → 调整机台释放时间后重试
-          3. 最多重试 20 次，若仍不收敛则返回 None ("calendar_no_stable_slot")
-
-        Returns:
-            (dry_run_info_dict, "") 成功 或 (None, reason_string) 失败。
-        """
+        lot = int(lot)
+        machine = int(machine)
+        ppid = int(ppid)
         try:
             steps = self.encoder.get_process_steps(lot, machine, ppid)
         except (KeyError, ValueError):
@@ -1680,223 +1683,39 @@ class ResourceCalendarEnv:
         if not steps or len(steps) == 0:
             return None, "ppid_stage_missing"
 
-        # 性能 (报告 §1.5 类开销)：直接在真实 state 日历上 add + rollback，
-        # 取代每次迭代 copy_calendar (O(全日历)，随排程变密而放大)。dry-run 结束前
-        # 必须把所有临时区间逐字节还原 (见 tests/test_phase2_dryrun_rollback.py)。
-        lot = int(lot)
-        machine = int(machine)
-        mc = self.state.machine_calendar
-        cc = self.state.chamber_calendar
-        wafer_count = int(self.encoder.wafer_counts[lot])
-        sub_batches = self._lot_sub_batches(lot)
         earliest_release = max(
             self.current_time,
             float(self.encoder.arrival_times[lot]),
         )
-        lot_release_time = self.encoder.find_earliest_slot(
-            mc.get(machine, []),
-            earliest_release,
-            0.0,
+        res = schedule_on_calendar(
+            lot,
+            machine,
+            ppid,
+            self.encoder,
+            self.state,
+            earliest_release=earliest_release,
+            noise_rng=None,
         )
+        if res.infeasible_reason:
+            return None, res.infeasible_reason
 
-        added_chamber = []     # 收敛迭代在 cc 上加入的区间 (待还原)
-        added_machine = None   # (machine, s, e) 若加入机台区间 (待还原)
-        result = None
-        reason = "calendar_no_stable_slot"
-        try:
-            # 迭代: 机台槽位 ↔ 晶圆层腔体调度
-            for _ in range(20):
-                iter_added = []
-                lot_start_time = np.inf
-                lot_end_time = -np.inf
-                infeasible = None
-
-                try:
-                    # 按子批排程 (报告 §1.5 批处理): 整批占一个区间，逐阶段流水
-                    for batch_size in sub_batches:
-                        batch_current_time = lot_release_time
-                        for stage in steps:
-                            selected = self._select_earliest_stage_resource(
-                                machine, stage, batch_current_time, cc,
-                            )
-                            if selected is None:
-                                infeasible = "chamber_side_unavailable"
-                                break
-                            resource_key, start_time, end_time = selected
-                            self.encoder.add_calendar_interval(
-                                cc, resource_key, start_time, end_time,
-                            )
-                            iter_added.append((resource_key, start_time, end_time))
-                            batch_current_time = end_time
-                            lot_start_time = min(lot_start_time, start_time)
-                            lot_end_time = max(lot_end_time, end_time)
-                        if infeasible:
-                            break
-                except Exception:
-                    self.encoder.rollback_calendar_intervals(cc, iter_added)
-                    return None, "calendar_insertion_error"
-
-                if infeasible:
-                    self.encoder.rollback_calendar_intervals(cc, iter_added)
-                    return None, infeasible
-
-                # 检查机台槽位是否与晶圆层匹配
-                lot_duration = max(0.0, lot_end_time - lot_release_time)
-                machine_slot_start = self.encoder.find_earliest_slot(
-                    mc.get(machine, []),
-                    earliest_release,
-                    lot_duration,
-                )
-
-                if abs(machine_slot_start - lot_release_time) <= 1e-9:
-                    # 收敛: 机台槽位与晶圆层一致
-                    added_chamber = iter_added
-                    self.encoder.add_calendar_interval(
-                        mc, machine, lot_release_time, lot_end_time,
-                    )
-                    added_machine = (machine, lot_release_time, lot_end_time)
-                    result = {
-                        "steps": steps,
-                        "lot_release_time": float(lot_release_time),
-                        "lot_start_time": float(lot_start_time),
-                        "lot_end_time": float(lot_end_time),
-                        "total_process_time": self.encoder.estimate_plan_total_process_time(
-                            steps,
-                            self.encoder.wafer_counts[lot],
-                        ),
-                        "qtime_risk": self.encoder.estimate_qtime_risk(
-                            lot, machine, ppid, steps,
-                        ),
-                    }
-                    break
-
-                # 不收敛: 回滚本次迭代区间，调整释放时间后重试
-                self.encoder.rollback_calendar_intervals(cc, iter_added)
-                lot_release_time = machine_slot_start
-        finally:
-            # 还原 state：先移除机台区间，再回滚腔体区间 (逆序)
-            if added_machine is not None:
-                self.encoder.remove_calendar_interval(
-                    mc, added_machine[0], added_machine[1], added_machine[2],
-                )
-            if added_chamber:
-                self.encoder.rollback_calendar_intervals(cc, added_chamber)
-
-        if result is not None:
-            return result, ""
-        return None, reason
-
-    def _lot_sub_batches(self, lot):
-        """工件的子批切分 (报告 §1.5 批处理建模)。
-
-        N 片 wafer → ⌈N/side_capacity⌉ 个子批 (满批优先)。side_capacity 未设时
-        默认 = wafer_count (整批一批)，与下层估时器口径一致。返回每个子批的 wafer 数。
-        """
-        from lower_layer_estimator import compute_sub_batches
-        wafer_count = int(self.encoder.wafer_counts[int(lot)])
-        side_capacity = getattr(self.encoder, "side_capacity", None)
-        if side_capacity is None or int(side_capacity) <= 0:
-            side_capacity = wafer_count
-        return compute_sub_batches(wafer_count, int(side_capacity))
-
-    def _allowed_resources_for(self, machine):
-        """机台 m 声明允许的 (chamber, side) 集合，按 machine 缓存 (静态数据)。
-
-        返回 None 表示未声明 machine_resources (不做范围过滤)。
-        """
-        cache = self._allowed_resources_cache
-        if machine in cache:
-            return cache[machine]
-        declared_resources = getattr(self.encoder, "machine_resources", {})
-        allowed = None
-        if declared_resources:
-            allowed = frozenset(
-                (int(chamber), int(side))
-                for chamber, side in declared_resources.get(int(machine), [])
-            )
-        cache[machine] = allowed
-        return allowed
-
-    def _select_earliest_stage_resource(
-        self,
-        machine,
-        candidate_resources,
-        wafer_current_time,
-        chamber_calendar,
-        process_time_delta=0.0,
-    ):
-        """从候选腔体资源中选择最早可用的 (chamber, side)。
-
-        对每个候选资源 (chamber, side, process_time):
-          1. 检查是否在 machine_resources 允许范围内
-          2. 在 chamber_calendar 中找最早可用槽位 (按实际时长预留)
-          3. 选择 (start_time, end_time, process_time, chamber, side) 最优者
-
-        Args:
-            process_time_delta: 加工时长的确定性偏移 (报告 §2.4.6 噪声 ε)。
-                实际时长 = max(1e-6, process_time + delta)，用于"找槽位"和 end_time。
-                **必须在找槽位阶段计入**：否则按 μ 预留的空档容纳不下被噪声拉长的区间，
-                插入时与后续已提交区间重叠 (见 tests/test_phase2_noise_overlap.py)。
-                默认 0.0 → 与无噪声行为完全一致 (dry-run 走此路径)。
-        """
-        candidate_resources = np.asarray(candidate_resources, dtype=float)
-        if candidate_resources.ndim != 2 or candidate_resources.shape[0] == 0:
-            return None
-
-        # 过滤: 仅保留机台声明的资源范围内的 (chamber, side)。
-        # 该集合只取决于 machine + encoder.machine_resources (静态)，缓存避免每次重建
-        # (热点: 原先每次调用都重算 setcomp，占 commit/dry-run 总时长约 8%)。
-        allowed_resources = self._allowed_resources_for(int(machine))
-
-        options = []
-        for row in candidate_resources:
-            chamber = int(row[0])
-            side = int(row[1])
-            if allowed_resources is not None and (chamber, side) not in allowed_resources:
-                continue
-            process_time = float(row[2])
-            # 实际时长 = μ + 噪声偏移 (clamp >0)；按实际时长预留槽位，避免插入时重叠
-            effective_pt = max(1e-6, process_time + float(process_time_delta))
-            resource_key = (int(machine), chamber, side)
-            start_time = self.encoder.find_earliest_slot(
-                chamber_calendar.get(resource_key, []),
-                wafer_current_time,
-                effective_pt,
-            )
-            end_time = start_time + effective_pt
-            options.append((
-                start_time,
-                end_time,
-                effective_pt,
-                chamber,
-                side,
-                resource_key,
-            ))
-
-        if not options:
-            return None
-
-        # 按 (start_time, end_time, process_time, chamber, side) 字典序取最小
-        start_time, end_time, _process_time, _chamber, _side, resource_key = min(
-            options,
-            key=lambda option: option[:5],
-        )
-        return resource_key, start_time, end_time
-
-    def _stage_process_sigma(self, lot, machine, ppid, stage_id):
-        """返回 (lot, machine, ppid) 第 stage_id 阶段 (1-based) 的加工时间 σ。
-
-        从 encoder.process_time_sigma 取；缺失则返回 0.0 (不注入噪声)。
-        """
-        sigmas = getattr(self.encoder, "process_time_sigma", {}).get(
-            (int(lot), int(machine), int(ppid))
-        )
-        if not sigmas:
-            return 0.0
-        idx = int(stage_id) - 1
-        if idx < 0 or idx >= len(sigmas):
-            return 0.0
-        return max(0.0, float(sigmas[idx]))
+        result = {
+            "steps": steps,
+            "lot_release_time": float(res.machine_interval[1]),
+            "lot_start_time": float(res.lot_start),
+            "lot_end_time": float(res.lot_end),
+            "total_process_time": self.encoder.estimate_plan_total_process_time(
+                steps,
+                self.encoder.wafer_counts[lot],
+            ),
+            "qtime_risk": self.encoder.estimate_qtime_risk(
+                lot,
+                machine,
+                ppid,
+                steps,
+            ),
+        }
+        return result, ""
 
     def _candidate_features(self, lot, machine, ppid, dry_run):
         """从 dry_run 结果计算 18 维候选特征向量。
@@ -2159,156 +1978,92 @@ class ResourceCalendarEnv:
         return conflict_count
 
     def _simulate_action(self, action, state):
-        """在指定状态上执行完整仿真 (修改日历, 返回调度行)。
+        """Commit-path schedule wrapper around lower-layer calendar scheduling."""
+        from lower_layer_scheduler import schedule_on_calendar
 
-        与 _dry_run_candidate 逻辑相同，但直接修改 state 的日历，
-        并更新 machine/chamber_available_time，用于最终提交。
-
-        Returns:
-            (lot_schedule, wafer_schedule, updated_state)
-        """
         lot = int(action.lot)
         machine = int(action.machine)
         ppid = int(action.ppid)
-        steps = self.encoder.get_process_steps(lot, machine, ppid)
-        wafer_count = int(self.encoder.wafer_counts[lot])
-        sub_batches = self._lot_sub_batches(lot)
         earliest_release = max(
             self.current_time,
             float(self.encoder.arrival_times[lot]),
         )
-        machine_calendar = state.machine_calendar
-        chamber_calendar = state.chamber_calendar
-        lot_release_time = self.encoder.find_earliest_slot(
-            machine_calendar.get(machine, []),
-            earliest_release,
-            0.0,
+        rng = self._noise_rng if self.process_noise_enabled else None
+        res = schedule_on_calendar(
+            lot,
+            machine,
+            ppid,
+            self.encoder,
+            state,
+            earliest_release=earliest_release,
+            noise_rng=rng,
         )
-
-        # 机台-腔体迭代收敛循环 (最多 20 次)
-        for _ in range(20):
-            trial_rows = []
-            added_intervals = []
-            lot_end_time = -np.inf
-
-            try:
-                # 按子批排程 (报告 §1.5 批处理): 子批内 wafer 同进同出、共享区间。
-                wafer_cursor = 0
-                for batch_size in sub_batches:
-                    batch_wafer_ids = list(
-                        range(wafer_cursor + 1, wafer_cursor + batch_size + 1)
-                    )
-                    wafer_cursor += batch_size
-                    batch_current_time = lot_release_time
-
-                    for stage_id, stage in enumerate(steps, start=1):
-                        # 噪声注入 (报告 §2.4.6): 仅在 commit 路径。规划用 μ，执行用实际值。
-                        # 整批一个实际时间 → 每 (子批, stage) 采样一次。
-                        # delta 必须在"找槽位"前计入，否则拉长的区间会与后续重叠。
-                        process_time_delta = 0.0
-                        if self.process_noise_enabled:
-                            sigma = self._stage_process_sigma(
-                                lot, machine, ppid, stage_id
-                            )
-                            if sigma > 0.0:
-                                process_time_delta = float(
-                                    self._noise_rng.normal(0.0, sigma)
-                                )
-
-                        selected = self._select_earliest_stage_resource(
-                            machine,
-                            stage,
-                            batch_current_time,
-                            chamber_calendar,
-                            process_time_delta=process_time_delta,
-                        )
-                        if selected is None:
-                            raise RuntimeError(
-                                f"No stage resource for Lot {lot} Stage {stage_id}"
-                            )
-
-                        resource_key, start_time, end_time = selected
-                        _, chamber, side = resource_key
-
-                        # 整个子批占用一个区间 (只登记一次)
-                        self.encoder.add_calendar_interval(
-                            chamber_calendar,
-                            resource_key,
-                            start_time,
-                            end_time,
-                        )
-                        added_intervals.append((resource_key, start_time, end_time))
-                        batch_current_time = end_time
-                        lot_end_time = max(lot_end_time, end_time)
-                        # 子批内每片 wafer 共享该区间，分别出一行
-                        for wafer_id in batch_wafer_ids:
-                            trial_rows.append([
-                                lot,
-                                wafer_id,
-                                machine,
-                                ppid,
-                                stage_id,
-                                chamber,
-                                side,
-                                start_time,
-                                end_time,
-                            ])
-            except Exception:
-                self.encoder.rollback_calendar_intervals(
-                    chamber_calendar,
-                    added_intervals,
-                )
-                raise
-
-            lot_duration = max(0.0, float(lot_end_time) - float(lot_release_time))
-            machine_slot_start = self.encoder.find_earliest_slot(
-                machine_calendar.get(machine, []),
-                earliest_release,
-                lot_duration,
-            )
-
-            if abs(machine_slot_start - lot_release_time) <= 1e-9:
-                # 收敛: 写入机台日历并退出循环
-                break
-
-            self.encoder.rollback_calendar_intervals(
-                chamber_calendar,
-                added_intervals,
-            )
-            lot_release_time = machine_slot_start
-        else:
+        if res.infeasible_reason:
             raise RuntimeError(
-                f"Could not find a stable machine calendar slot for Lot {lot}"
+                f"schedule_on_calendar failed for Lot {lot}: {res.infeasible_reason}"
             )
 
-        # 将机台区间写入日历
+        added_intervals = []
         try:
+            for resource_key, start_time, end_time in res.batch_intervals:
+                self.encoder.add_calendar_interval(
+                    state.chamber_calendar,
+                    resource_key,
+                    start_time,
+                    end_time,
+                )
+                added_intervals.append((resource_key, start_time, end_time))
+            m_id, m_start, m_end = res.machine_interval
             self.encoder.add_calendar_interval(
-                machine_calendar,
-                machine,
-                lot_release_time,
-                lot_end_time,
+                state.machine_calendar,
+                m_id,
+                m_start,
+                m_end,
             )
         except Exception:
             self.encoder.rollback_calendar_intervals(
-                chamber_calendar,
+                state.chamber_calendar,
                 added_intervals,
             )
             raise
 
-        # 更新可用时间
         state.machine_available_time[machine] = max(
             state.machine_available_time.get(machine, self.current_time),
-            float(lot_end_time),
+            float(res.lot_end),
         )
-        for resource_key, _start_time, end_time in added_intervals:
+        for resource_key, _start_time, end_time in res.batch_intervals:
             state.chamber_available_time[resource_key] = max(
                 state.chamber_available_time.get(resource_key, self.current_time),
                 float(end_time),
             )
 
+        steps = self.encoder.get_process_steps(lot, machine, ppid)
+        n_stages = len(steps)
+        trial_rows = []
+        for b_idx, wafer_ids in enumerate(res.subbatch_wafer_map):
+            stage_slice = res.batch_intervals[
+                b_idx * n_stages:(b_idx + 1) * n_stages
+            ]
+            for stage_id, (resource_key, start_time, end_time) in enumerate(
+                stage_slice,
+                start=1,
+            ):
+                _machine, chamber, side = resource_key
+                for wafer_id in wafer_ids:
+                    trial_rows.append([
+                        lot,
+                        wafer_id,
+                        machine,
+                        ppid,
+                        stage_id,
+                        chamber,
+                        side,
+                        start_time,
+                        end_time,
+                    ])
+
         lot_schedule = np.asarray(
-            [[lot, machine, ppid, lot_release_time, lot_end_time]],
+            [[lot, machine, ppid, res.machine_interval[1], res.lot_end]],
             dtype=float,
         )
         wafer_schedule = np.asarray(trial_rows, dtype=float)
@@ -2450,6 +2205,14 @@ class ResourceCalendarEnv:
         lot_end = float(dry.lot_schedule[0, 4]) if dry.lot_schedule.shape[0] > 0 else 0.0
         process_time = lot_end - lot_start
         due_date = float(self.encoder.due_dates.get(int(action.lot), np.inf))
+        # 该 lot 的总加工工作量 (供 exec 通道 packing = total_work/span 用)
+        try:
+            work_steps = self.encoder.get_process_steps(int(action.lot), machine, int(action.ppid))
+            total_work = float(self.encoder.estimate_plan_total_process_time(
+                work_steps, self.encoder.wafer_counts[int(action.lot)],
+            ))
+        except (KeyError, ValueError):
+            total_work = 0.0
 
         # 计算新增的 Q-time 违反
         q_before, _ = self.encoder.compute_q_time_violation(self.wafer_schedule)
@@ -2495,6 +2258,7 @@ class ResourceCalendarEnv:
             "selected_lot_start": lot_start,
             "selected_lot_end": lot_end,
             "selected_lot_process_time": process_time,
+            "selected_lot_total_work": total_work,
             "new_qtime_violation": new_qtime_violation,
             "priority_rank_penalty": priority_rank_penalty,
             "current_time": self.current_time,

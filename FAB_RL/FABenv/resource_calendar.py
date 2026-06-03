@@ -190,6 +190,32 @@ class CalendarDecoderMixin:
 
         return total * int(wafer_count)
 
+    def _qtime_limits_for(self, lot, machine, ppid):
+        """返回某 (lot, machine, ppid) 的 Q-time 约束 [(from_stage, to_stage, limit), ...]。
+
+        性能 (profile §1.6.1)：`estimate_qtime_risk` 被候选池里每个候选每步调用一次，
+        而 `q_time_limits` 在压力实例下有数千条 (≈ lots×machines×ppids×stage对)，每个
+        (lot,machine,ppid) 只匹配其中极少数。原实现每次线性扫描整张表 → O(总约束数)，
+        是实测训练瓶颈 (≈70% 墙钟)。此处按 (lot,machine,ppid) 建一次倒排索引，使每次
+        查询只触及自己的约束。
+
+        索引惰性构建并以源 dict 的身份做失效判定：实例构造后部分 builder 会整体重新
+        赋值 `encoder.q_time_limits = {...}` (见 problem_instances.py)，故用 `is` 比对源
+        对象，源被替换时自动重建。约束在 episode 内不就地修改，索引无需更细的失效。
+        """
+        src = self.q_time_limits
+        index = getattr(self, "_qtime_limits_index", None)
+        if index is None or getattr(self, "_qtime_limits_index_src", None) is not src:
+            index = {}
+            for key, limit in src.items():
+                k_lot, k_machine, k_ppid, from_stage, to_stage = map(int, key)
+                index.setdefault((k_lot, k_machine, k_ppid), []).append(
+                    (from_stage, to_stage, float(limit))
+                )
+            self._qtime_limits_index = index
+            self._qtime_limits_index_src = src
+        return index.get((int(lot), int(machine), int(ppid)), ())
+
     def estimate_qtime_risk(self, lot, machine, ppid, steps):
         """估算 Q-time 风险 — 中间阶段累计时间超出 Q-time 限制的总量。
 
@@ -200,14 +226,10 @@ class CalendarDecoderMixin:
             Q-time 风险值 (非负浮点数)。
         """
         risk = 0.0
+        n_steps = len(steps)
 
-        for key, q_time_limit in self.q_time_limits.items():
-            key_lot, key_machine, key_ppid, from_stage, to_stage = map(int, key)
-
-            # 仅处理当前 (lot, machine, ppid) 的约束
-            if (key_lot, key_machine, key_ppid) != (int(lot), int(machine), int(ppid)):
-                continue
-            if from_stage < 1 or to_stage > len(steps):
+        for from_stage, to_stage, q_time_limit in self._qtime_limits_for(lot, machine, ppid):
+            if from_stage < 1 or to_stage > n_steps:
                 continue
 
             intermediate_time = 0.0
@@ -215,6 +237,6 @@ class CalendarDecoderMixin:
                 resources = np.asarray(steps[stage_id], dtype=float)
                 intermediate_time += float(np.min(resources[:, 2]))
 
-            risk += max(0.0, intermediate_time - float(q_time_limit))
+            risk += max(0.0, intermediate_time - q_time_limit)
 
         return float(risk)

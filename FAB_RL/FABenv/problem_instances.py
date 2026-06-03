@@ -384,18 +384,26 @@ def build_small_encoder():
     return encoder
 
 
-def build_pressure_test_encoder(seed=2026):
+def build_pressure_test_encoder(seed=2026, qtime_limit=3.0, arrival_mean_gap=0.6):
     """构建 50 Lot × 10 机台的压力测试实例。
 
     参数:
       - 50 Lot, 10 机台, 每机台 5 PPID, 每 Lot 10 晶圆
       - 5 腔体, 2 面 (A/B), 3 个工艺步骤
       - 处理时间: 1.5 + 0.2*stage + U(0, 2.5), 每步 2-4 个备选资源
-      - 到达时间: 全部 t=0
+      - 到达时间: Poisson 到达 (指数间隔, 均值 arrival_mean_gap), lot1 在 t=0 (错峰)
       - 交货期: arrival + 180 + 0.5*lot_id
       - 优先级: U(0, 10)
       - 配方: 5 种配方循环分配
       - 机台组: 每 5 台一组
+      - 阶段间 Q-time: 对 (1,2) 与 (2,3) 设上限 qtime_limit (材料队列时间约束)
+
+    可调旋钮 (制造区分度, 见 docs 上下层解耦后续):
+      qtime_limit:      阶段间 Q-time 上限 (越小越易因腔体争用而违反 → 派工序列更关键)
+      arrival_mean_gap: 错峰到达的平均间隔 (越大越分散 → util 余量越多, "等 vs 派"更有意义)
+
+    历史 bug 修复: 此实例此前从不设置 q_time_limits, 导致 compute_q_time_violation
+    恒为 0 → qtime 指标/奖励通道 r_qtime/§3.3 Lagrangian 全部静默失效。
 
     用途: Phase 1 环境演示的压力测试、Phase 2 RL 训练的大规模基准。
     """
@@ -448,8 +456,13 @@ def build_pressure_test_encoder(seed=2026):
                     steps.append(np.array(candidates, dtype=float))
                 ppid_steps[(lot, machine, ppid)] = steps
 
+    # 错峰到达 (Poisson 到达过程): 指数间隔累加, lot1 在 t=0。
+    # 制造 util 余量, 并让"现在派 vs 等下一个更优 lot"成为有意义的决策 (喂将来的 DDT)。
+    inter_arrival_gaps = rng.exponential(arrival_mean_gap, size=num_lots)
+    inter_arrival_gaps[0] = 0.0
+    arrival_cumsum = np.cumsum(inter_arrival_gaps)
     arrival_times = {
-        lot: 0.0
+        lot: float(arrival_cumsum[lot - 1])
         for lot in range(1, num_lots + 1)
     }
 
@@ -498,6 +511,17 @@ def build_pressure_test_encoder(seed=2026):
     encoder.due_dates = {
         lot: float(encoder.arrival_times[lot] + 180.0 + 0.5 * lot)
         for lot in range(1, num_lots + 1)
+    }
+    # 阶段间 Q-time 上限 (材料队列时间约束): (1,2) 与 (2,3) 两个窗口。
+    # 键 (lot, machine, ppid, from_stage, to_stage) → limit; 对所有可被调度的
+    # (machine, ppid) 都登记 (约束是 lot 材料属性, 与最终选哪台/哪个配方无关)。
+    # mask 仍只 enforce lot 完工期 (qtime_deadline); 阶段间违反由指标/奖励/Lagrangian 处理。
+    encoder.q_time_limits = {
+        (lot, machine, ppid, from_stage, to_stage): float(qtime_limit)
+        for lot in range(1, num_lots + 1)
+        for machine in range(1, num_machines + 1)
+        for ppid in feasible_ppids[(lot, machine)]
+        for (from_stage, to_stage) in ((1, 2), (2, 3))
     }
     # 随机优先级 [0, 10)
     encoder.priorities = {

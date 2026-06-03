@@ -39,3 +39,10 @@ FAB_RL/FABenv/pressure_outputs/
 # Trained model checkpoints & evaluation artifacts (generated, regenerable)
 *.pt
 FAB_RL/FABenv/*.jsonl
+
+# Experiment/probe script outputs (regenerable)
+FAB_RL/FABenv/results/
+
+# Profiling artifacts (regenerable)
+*.prof
+

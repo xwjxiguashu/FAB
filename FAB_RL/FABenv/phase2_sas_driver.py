@@ -1,3 +1,4 @@
+
 """Phase 2 SAS Episode Driver — 编排完整的调度 episode。
 
 Phase2EpisodeDriver 管理从初始状态到终止条件的完整 episode 流程:
@@ -407,10 +408,23 @@ class Phase2EpisodeDriver:
         """构建 episode 摘要字典。"""
         if not self.termination_reason:
             self.termination_reason = "max_steps_exceeded"
+        # 原始(未归一化)指标，用于看真实学习曲线 (mean_reward 被常数通道淹没)。
+        avg_utilization = 0.0
+        qtime_violation_count = 0.0
+        try:
+            objs = self.env.encoder.evaluate_objectives(
+                self.env.lot_schedule, self.env.wafer_schedule, current_time=0.0,
+            )
+            qtime_violation_count = float(objs[0])
+            avg_utilization = float(-objs[5])
+        except Exception:
+            pass
         return {
             "steps": int(steps),
             "episode_reward": float(episode_reward),
             "completed_lots": len(self.env.completed_lots),
+            "avg_utilization": avg_utilization,
+            "qtime_violation_count": qtime_violation_count,
             "wait_steps": self.total_wait_steps_per_episode,
             "failed_actions": self.failed_actions_per_episode,
             "consecutive_failed_actions": self.consecutive_failed_actions,

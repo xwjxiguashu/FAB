@@ -149,11 +149,14 @@ def build_multihead_training_components(top_k=8, hidden_dim=128, learning_rate=3
                                         process_noise_enabled=False, noise_seed=None,
                                         use_qtime_lagrangian=False, qtime_cost_budget=0.0,
                                         qtime_lambda_lr=0.05, qtime_lambda_init=0.0,
+                                        priority_filter_mode="soft", priority_min_gap=0.0,
                                         device=None):
     device = resolve_device(device)
     encoder = build_small_encoder() if encoder_factory is None else encoder_factory()
     env = ResourceCalendarEnv(encoder, top_k=top_k, w_lookahead=w_lookahead,
-                              process_noise_enabled=process_noise_enabled, noise_seed=noise_seed)
+                              process_noise_enabled=process_noise_enabled, noise_seed=noise_seed,
+                              priority_filter_mode=priority_filter_mode,
+                              priority_min_gap=priority_min_gap)
     env.reset()
     observation_encoder = Phase2ObservationEncoder(lookahead=lookahead)
     reward_vector_config = RewardVectorConfig()
@@ -243,6 +246,8 @@ def _run_multihead_parallel(components, num_episodes, n_workers, encoder_kind,
         top_k=int(getattr(components["env"], "top_k", 8)),
         process_noise_enabled=process_noise_enabled,
         noise_seed_base=noise_seed_base,
+        priority_filter_mode=getattr(components["env"], "priority_filter_mode", "soft"),
+        priority_min_gap=getattr(components["env"], "priority_min_gap", 0.0),
     )
     import time as _time
 
@@ -274,11 +279,16 @@ def _run_multihead_parallel(components, num_episodes, n_workers, encoder_kind,
 
             mean_reward = sum(float(s["episode_reward"]) for s in summaries) / len(summaries)
             mean_completed = sum(float(s["completed_lots"]) for s in summaries) / len(summaries)
+            # 原始(未归一化)指标 —— 真实学习曲线看这两个，而非被常数通道淹没的 mean_reward
+            mean_util = sum(float(s.get("avg_utilization", 0.0)) for s in summaries) / len(summaries)
+            mean_qtime = sum(float(s.get("qtime_violation_count", 0.0)) for s in summaries) / len(summaries)
             for summary in summaries:
                 row = {
                     "episode": episode_idx, "iter": it,
                     "episode_reward": float(summary["episode_reward"]),
                     "completed_lots": int(summary["completed_lots"]),
+                    "avg_utilization": float(summary.get("avg_utilization", 0.0)),
+                    "qtime_violation_count": float(summary.get("qtime_violation_count", 0.0)),
                     "termination_reason": summary["termination_reason"],
                     **stats,
                     "qtime_cost": float(total_cost / max(1, len(results))),
@@ -290,7 +300,8 @@ def _run_multihead_parallel(components, num_episodes, n_workers, encoder_kind,
                 episode_idx += 1
             print(f"[parallel iter {it+1}/{n_iters}] {len(results)} eps  "
                   f"collect={_collect_dt:.1f}s ({_collect_dt/max(1,len(results)):.1f}s/ep) "
-                  f"mean_reward={mean_reward:.3f} mean_completed={mean_completed:.1f} "
+                  f"mean_reward={mean_reward:.3f} util={mean_util:.3f} qtime={mean_qtime:.1f} "
+                  f"completed={mean_completed:.1f} "
                   f"loss={stats['policy_loss']:.4f} lambda={trainer.lambda_qtime:.4f}",
                   flush=True)
             if on_episode is not None:
@@ -300,7 +311,8 @@ def _run_multihead_parallel(components, num_episodes, n_workers, encoder_kind,
 
 def main(num_episodes=3, mode="small", tensorboard_logdir=None, save_path=None,
          use_qtime_lagrangian=False, qtime_cost_budget=0.0, qtime_lambda_lr=0.05,
-         device=None, instance="small", save_every=0, parallel=0):
+         device=None, instance="small", save_every=0, parallel=0,
+         priority_filter_mode="soft", priority_min_gap=0.0):
     if mode == "multihead":
         mh_encoder_factory = (
             build_pressure_test_encoder if instance == "pressure" else None
@@ -310,6 +322,8 @@ def main(num_episodes=3, mode="small", tensorboard_logdir=None, save_path=None,
             use_qtime_lagrangian=use_qtime_lagrangian,
             qtime_cost_budget=qtime_cost_budget,
             qtime_lambda_lr=qtime_lambda_lr,
+            priority_filter_mode=priority_filter_mode,
+            priority_min_gap=priority_min_gap,
             device=device,
         )
     elif mode == "pressure":
@@ -416,10 +430,19 @@ def _parse_args():
         "--parallel", type=int, default=0,
         help="(multihead only) 多进程并行环境的 worker 数 (>1 启用)；用多核 CPU 加速采集",
     )
+    parser.add_argument(
+        "--priority-mode", choices=["soft", "strict"], default="soft",
+        help="候选池优先级过滤模式 (报告 §3.4)：soft=不删候选(默认); "
+             "strict=只保留最高优先级候选，RL 物理上无法选低优先级",
+    )
+    parser.add_argument(
+        "--priority-min-gap", type=float, default=0.0,
+        help="strict 模式下的优先级容差 (priority >= max_pri - gap 的候选保留)",
+    )
     return parser.parse_args()
 
 
-if __name__ == "__main__":
+def _run_cli():
     args = _parse_args()
     main(
         num_episodes=args.episodes,
@@ -433,4 +456,29 @@ if __name__ == "__main__":
         instance=args.instance,
         save_every=args.save_every,
         parallel=args.parallel,
+        priority_filter_mode=args.priority_mode,
+        priority_min_gap=args.priority_min_gap,
     )
+
+
+if __name__ == "__main__":
+    # 改下面参数即可；要用命令行就注释这段 main(...)、解开末尾的 _run_cli()。
+    # save_path 锚定到本文件目录：VSCode 的 cwd 常是工作区根，相对路径会存错地方。
+    import os as _os
+    _HERE = _os.path.dirname(_os.path.abspath(__file__))
+
+    # 拉满核心：worker = 逻辑核 - 2（留给主进程/系统）。
+    # 关键：PPO 更新次数 = episodes / parallel；为保持训练质量，episodes 随 worker 数放大，
+    # 使更新次数固定为 _ITERS（≈50）。wall time 几乎不变，但每次更新用的数据更多。
+    _WORKERS = max(1, (_os.cpu_count() or 4) - 2)
+    _ITERS = 50
+    main(
+        mode="multihead",
+        instance="pressure",
+        num_episodes=_WORKERS * _ITERS,   # 例: 14 worker → 700 episode → 仍 ~50 次更新
+        parallel=_WORKERS,                # 启动时各 worker import torch 会静默几十秒，勿中断
+        save_every=_WORKERS * 5,          # 约每 5 次迭代存一次 checkpoint
+        save_path=_os.path.join(_HERE, "pressure_mh_hard.pt"),
+        device="auto",                    # 瓶颈在 CPU 仿真，GPU 无加速
+    )
+    # _run_cli()  # 命令行用法

@@ -12,7 +12,7 @@ MaskedCategoricalPolicy:
 
 Phase2SASMultiHeadActorCritic:
   - 与单头共享 candidate_encoder 和 actor_head
-  - 4 个独立 value 头 (exec/qtime/util/progress), 各自 Linear(hidden+global→hidden→1)
+  - 独立 value 头 (exec/qtime/util), 各自 Linear(hidden+global→hidden→1)
   - critic_values 返回 {channel: value} 字典
 """
 
@@ -175,11 +175,11 @@ class Phase2SASMultiHeadActorCritic(nn.Module):
       - critic_values 返回 {channel: value} 字典 (每个 value 形状 (batch,))
       - sample_action / greedy_action / evaluate_actions 输出键为 "values" (dict)
 
-    通道顺序固定: ("exec", "qtime", "util", "progress")
+    通道顺序固定: ("exec", "qtime", "util")
     """
 
     def __init__(self, candidate_dim, global_dim, hidden_dim=128,
-                 channels=("exec", "qtime", "util", "progress")):
+                 channels=("exec", "qtime", "util")):
         super().__init__()
         self.channels = tuple(channels)
         # 候选编码器: 2 层 MLP (与单头结构相同)
@@ -191,7 +191,7 @@ class Phase2SASMultiHeadActorCritic(nn.Module):
         )
         # Actor: 每候选 → 标量 logit (与单头结构相同)
         self.actor_head = nn.Linear(hidden_dim, 1)
-        # 4 个独立 Critic 头, 每通道一个
+        # 独立 Critic 头, 每通道一个
         self.critics = nn.ModuleDict({
             c: nn.Sequential(
                 nn.Linear(hidden_dim + global_dim, hidden_dim),

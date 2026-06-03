@@ -215,8 +215,8 @@ class Phase2RolloutBuffer:
         self.advantages.clear()
 
 
-# 固定四通道顺序（报告 §4.7）
-MULTIHEAD_CHANNELS = ("exec", "qtime", "util", "progress")
+# 固定三通道顺序（报告 §4.7；progress 通道已删除——恒为 1.0 的死重）
+MULTIHEAD_CHANNELS = ("exec", "qtime", "util")
 
 
 @dataclass
