@@ -1237,25 +1237,33 @@ ledger 字段:
 
 ### 7.6 当前代码进度与 VC-MCTS 在线预留实证（与仓库对齐）
 
-截至当前代码版本，VC-MCTS 已不再只是方案设计，已经完成第一阶段在线预留闭环。相关实现文件如下：
+截至当前代码版本，VC-MCTS 已不再只是方案设计，已经完成“在线预留 + dispatch delegate + SAS policy 对接 + 噪声 smoke”的闭环。相关实现文件如下：
 
 ```text
 reservation_ledger.py       # reservation ledger，按 machine 记录预留，并防止同一 future_lot 被重复预留
 reservation_rop.py          # ROP 候选生成，跳过已预留机器与已预留 future_lot
 reservation_simulator.py    # reservation-aware rollout/episode helper，提供 clone 与 ledger-aware 推进
-vc_mcts_planner.py          # root-level VC-MCTS planner: no_op / dispatch / reserve 三类 root edge
-vc_mcts_probe.py            # baseline / oracle / VC-MCTS probe，支持 --workers 并行、trace/summary 输出
-vc_mcts_trace_summary.py    # JSONL trace 汇总，统计 reserve 可用率、选择率、gap、重复预留等诊断字段
+dispatch_delegate.py        # RuleDispatchDelegate / SASPolicyDispatchDelegate，封装当前派工具体动作选择
+vc_mcts_planner.py          # root-level VC-MCTS planner: no_op / delegate_dispatch / reserve root edge
+vc_mcts_probe.py            # baseline / oracle / VC-MCTS probe，支持 --workers、--dispatch-delegate、trace/summary 输出
+vc_mcts_trace_summary.py    # JSONL trace 汇总，统计 reserve 可用率、选择率、gap、重复预留与 lost_to 诊断
 ```
 
-**当前实现边界。** 代码已经跑通“VC-MCTS 管预留 + 规则 rollout/TopK dispatch 管派工”的第一阶段；训练好的 SAS policy 尚未作为下层派工器接入。因此，报告中凡涉及“SAS 作为搜索先验/基策略/叶子估值”的内容应理解为目标架构或下一阶段集成方向，而非当前已完成项。当前实际策略为：
+**当前实现边界。** 代码已经从第一阶段的“VC-MCTS 管预留 + TopK dispatch/rule rollout 管派工”推进到第二阶段的 **dispatch delegate** 结构：VC-MCTS 只在 root 层比较 `reserve / no_op / delegate_dispatch`，具体 `(lot,ppid)` 派工交给 delegate。当前 delegate 有两种：
+
+```text
+RuleDispatchDelegate(strategy=FIFO/SPT/...)  # 规则派工，用于复刻旧行为与消融对照
+SASPolicyDispatchDelegate(checkpoint)        # 训练好的 SAS policy 贪心/采样派工，非法/wait/padding 时回退到 rule
+```
+
+因此，当前实际策略为：
 
 ```text
 root action = no_op
-            + TopK dispatch(lot,ppid) from ResourceCalendarEnv.build_candidate_pool(machine)
+            + delegate_dispatch(machine)  # 由 rule 或 SAS delegate 选择具体 lot/ppid
             + TopB reserve(machine,future_lot) from ROP
 
-rollout policy = rule strategy（当前验证主要用 FIFO）
+rollout policy = reservation-aware rollout + 同一个 dispatch delegate
 final choice   = qtime_count → qtime_total → O2 → utilization → visits
 no_op gating   = no_op 必须在 qtime_count 或 qtime_total 上严格优于非 no_op 边，否则降级
 ```
@@ -1267,55 +1275,65 @@ no_op gating   = no_op 必须在 qtime_count 或 qtime_total 上严格优于非 
 3. **no_op gating。** 早期完整轻预算中 no_op 过多（120 次决策里 no_op=89，episode 只完成 31/50）。加入 gating 后，no_op 降到 1 次，完整 episode 能完成 50/50。
 4. **重复预留去重。** `ReservationLedger` 增加 `reserved_lots()` / `is_lot_reserved()`，并拒绝同一 future_lot 被不同机器重复预留；ROP 生成时跳过已预留 lot。trace summary 新增 `duplicate_selected_reserve_lots`。
 5. **多进程 seed 并行。** `vc_mcts_probe.py` 新增 `--workers`；多 worker 时每个 seed 自动写独立 trace/summary，避免多个进程同时 append 同一 JSONL。
+6. **dispatch delegate 接口。** `--dispatch-delegate topk|rule|sas` 已落地；`topk` 保留旧 TopK dispatch 行为，`rule` 收缩为单个 `delegate_dispatch` 边并用规则选择动作，`sas` 加载 checkpoint 并由 SAS policy 贪心选择当前派工动作。
+7. **trace summary lost_to 修复。** `reserve_lost_to_counts` 现在按最终 selected action 统计，并把 `delegate_dispatch` 纳入 best non-reserve gap；避免 raw no_op 被 no_op gating 降级后仍误报为 reserve 输给 no_op。
 
-**late_hi 完整轻预算验证。** 运行命令：
-
-```powershell
-python vc_mcts_probe.py `
-  --instance late_hi `
-  --seeds 2 `
-  --workers 2 `
-  --strategy FIFO `
-  --skip-oracle `
-  --top-b 3 `
-  --top-k-dispatch 2 `
-  --n-iter 2 `
-  --max-steps 600 `
-  --rollout-max-steps 60 `
-  --max-decisions 120 `
-  --trace-out results\vc_mcts_late_hi_complete_light_gated_s2_trace.jsonl `
-  --trace-summary-out results\vc_mcts_late_hi_complete_light_gated_s2_summary.json `
-  --progress-every 10
-```
-
-输出文件按 seed 拆分：
-
-```text
-results/vc_mcts_late_hi_complete_light_gated_s2_seed0_trace.jsonl
-results/vc_mcts_late_hi_complete_light_gated_s2_seed0_summary.json
-results/vc_mcts_late_hi_complete_light_gated_s2_seed1_trace.jsonl
-results/vc_mcts_late_hi_complete_light_gated_s2_seed1_summary.json
-```
-
-结果（`--noise` 未开启，因此该轮主要验证确定性重复与并行流程；两个 seed 仍可能因并行进程/内部排序细节产生轻微差异）：
+**late_hi 完整轻预算验证（历史 TopK 第一阶段）。** 在接入 delegate 前，TopK dispatch 版本已经证明 VC-MCTS 可稳定选择 reserve、清 Q-time，并完成完整 episode：
 
 | seed | baseline qtime | VC qtime | baseline O2 | VC O2 | O2 改善 | completed | termination | reservations | reserve 选择率 | no_op | duplicate reserve |
 |---:|---:|---:|---:|---:|---:|---:|---|---:|---:|---:|---|
 | 0 | 20 | 0 | 1664.32 | 1137.27 | -527.05 | 50/50 | all_lots_completed | 19 | 42.2% | 1 | [] |
 | 1 | 20 | 0 | 1664.32 | 1156.86 | -507.46 | 50/50 | all_lots_completed | 20 | 45.5% | 1 | [] |
 
+**late_hi delegate 对接验证（`--noise` 未开启）。** 接入 `delegate_dispatch` 后，同一轻预算下：
+
+```powershell
+python vc_mcts_probe.py --instance late_hi --seeds 1 --strategy FIFO --skip-oracle `
+  --dispatch-delegate rule --top-b 3 --top-k-dispatch 2 --n-iter 2 `
+  --max-steps 600 --rollout-max-steps 60 --max-decisions 120
+
+python vc_mcts_probe.py --instance late_hi --seeds 1 --strategy FIFO --skip-oracle `
+  --dispatch-delegate sas --sas-checkpoint pressure_mh_hard.pt `
+  --top-b 3 --top-k-dispatch 2 --n-iter 2 `
+  --max-steps 600 --rollout-max-steps 60 --max-decisions 120
+```
+
+| 模式 | seed | baseline qtime | VC qtime | baseline O2 | VC O2 | O2 改善 | completed | reservations | reserve 选择率 | selected_counts | duplicate reserve |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---|---|
+| VC + rule delegate | 0 | 20 | 0 | 1664.32 | 1156.89 | -507.43 | 50/50 | 15 | 32.6% | delegate_dispatch=35, reserve=15, no_op=1 | [] |
+| VC + SAS delegate | 0 | 20 | 0 | 1664.32 | **955.83** | **-708.49** | 50/50 | 20 | 42.6% | delegate_dispatch=30, reserve=20 | [] |
+
+这说明 SAS delegate 不只是“接口接通”：在 deterministic `late_hi` seed=0 上，`VC + SAS` 在同样清零 Q-time 的前提下，相比 `VC + rule` 额外降低 O2 约 **201.06**，且平均利用率更高（0.8787 vs 0.8097）。
+
+**late_hi + process noise 初步鲁棒性验证。** 开启 `--noise` 后，用相同轻预算跑 `seeds=2, workers=2`，分别比较 rule delegate 与 SAS delegate：
+
+| 模式 | seed | baseline qtime | VC qtime | baseline O2 | VC O2 | O2 改善 | completed | reservations | reserve 选择率 | duplicate reserve |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---|
+| VC + rule + noise | 0 | 8 | 0 | 1717.01 | 1109.15 | -607.86 | 50/50 | 25 | 56.8% | [] |
+| VC + rule + noise | 1 | 10 | 0 | 1694.39 | 1196.26 | -498.13 | 50/50 | 22 | 48.9% | [] |
+| VC + SAS + noise | 0 | 8 | 0 | 1717.01 | 1226.65 | -490.37 | 50/50 | 25 | 55.6% | [] |
+| VC + SAS + noise | 1 | 10 | 0 | 1694.39 | **1006.56** | **-687.83** | 50/50 | 25 | 61.0% | [] |
+
+平均值：
+
+```text
+baseline O2 avg          = 1705.70
+VC + rule + noise O2 avg = 1152.71   平均改善 -553.00
+VC + SAS  + noise O2 avg = 1116.60   平均改善 -589.10
+```
+
 阶段性结论：
 
 ```text
 1. VC-MCTS 已经具备在线预留能力：会生成 reserve、评估 reserve、选择 reserve、兑现/释放 ledger。
-2. 在 late_hi 完整轻预算下，两个 seed 都完成 50/50 lot，且 Q-time violation 从 baseline 的 20 降到 0。
-3. O2(priority_weighted_wait) 稳定改善约 500+，说明不是单纯牺牲 O2 换 Q-time。
-4. no_op gating 解决了早期“等待过多导致 episode 跑不完”的问题。
-5. duplicate_selected_reserve_lots 为空，说明同一 future_lot 重复预留 bug 已修复。
-6. 当前结果仍是轻预算 + rule rollout 版本；下一阶段应验证 noise 鲁棒性，并把 dispatch 从 TopK/rule delegate 逐步替换为训练好的 SAS policy。
+2. delegate_dispatch 已落地：VC-MCTS 负责 reserve/no_op/delegate_dispatch，rule 或 SAS delegate 负责当前派工。
+3. 在 deterministic late_hi 上，VC+SAS 明显优于 VC+rule（O2 955.83 vs 1156.89），同时 Q-time violation 都从 20 降到 0。
+4. 在 late_hi + process noise 的 seeds=2 初步验证中，VC+rule 与 VC+SAS 都保持 50/50 完成并把 Q-time violation 清零。
+5. noise 下 SAS delegate 的平均 O2 略优于 rule delegate（1116.60 vs 1152.71），但 seed-level 存在交叉；这说明接口与鲁棒性 smoke 通过，但“SAS 在噪声下稳定显著优于 rule”仍需要更多 seeds 或针对 noise 的 checkpoint 微调。
+6. duplicate_selected_reserve_lots 始终为空，说明重复预留 bug 已修复；trace summary 的 lost_to 诊断也已与最终 selected action 对齐。
 ```
 
-因此，当前项目状态可表述为：**VC-MCTS 预留模块第一阶段已经闭环并在 late_hi 上通过完整轻预算验证；尚未完成与训练型 SAS policy 的最终 delegate 集成，也尚未进行 noise/multi-instance 鲁棒性验证。**
+因此，当前项目状态可表述为：**VC-MCTS 预留模块已经完成在线闭环、dispatch delegate 抽象、SAS checkpoint 对接，并在 `late_hi` deterministic 与 process-noise smoke 中通过完整轻预算验证；下一阶段重点从“能否跑通”转为“更多 seeds / 更多实例族 / noise 下 SAS checkpoint 是否需要重训或微调”。**
 
 ---
 
@@ -1344,14 +1362,14 @@ results/vc_mcts_late_hi_complete_light_gated_s2_seed1_summary.json
 
 **9.2 与三层字典序结构是否冲突。** 不冲突，且实现得更直接。Q-time 仍是第 0 层硬约束——搜索的准入层（机制 1）对违反机会约束的边硬剪枝、对窗外残差用 λ_qtime 软压（§5.4），与 SAS 同口径、同下层估时器；priority 是第 1 层强偏好——由优先级-能力鲁棒性 ρ_pc 与 reserve 边承载（机制 2，§5.5）；utilization 仍是唯一可让步软目标，进入价值估计 q̂。执行顺序"先剪枝→再按 ρ_pc+价值选"天然实现字典序。
 
-**9.3 与 SAS 职责是否混淆。** 目标架构中不混淆：VC-MCTS 负责“是否预留/为谁预留/是否等待”，SAS 负责“当前机器派哪个 `(lot,ppid)`”。但**当前代码第一阶段尚未接入训练好的 SAS policy**，因此 `vc_mcts_planner.py` 仍把 Top-K dispatch 作为 root edge，与 no_op/reserve 一起由 VC-MCTS 选择；rollout 也使用 FIFO 等规则策略。这是为了先把 reservation ledger、ROP、rollout、trace、去重与 no_op gating 跑通。下一阶段应把 dispatch edge 抽象为 `delegate_dispatch`，先接 rule delegate 验证等价，再替换为 SAS policy。
+**9.3 与 SAS 职责是否混淆。** 目标架构中不混淆：VC-MCTS 负责“是否预留/为谁预留/是否等待”，SAS 负责“当前机器派哪个 `(lot,ppid)`”。当前代码已经通过 `dispatch_delegate.py` 把这一职责边界落地：`vc_mcts_planner.py` 在启用 delegate 时只比较 `reserve / no_op / delegate_dispatch`，具体 dispatch 动作由 `RuleDispatchDelegate` 或 `SASPolicyDispatchDelegate` 选择。`topk` 模式仍保留作为旧行为与消融对照；`rule` 模式用于验证 delegate 抽象不破坏原规则派工；`sas` 模式加载 checkpoint（如 `pressure_mh_hard.pt`）并在非法/wait/padding 时回退到 rule。
 
 **9.4 ROP 是否会过于苛刻。** 仍为宽触发式，且角色更纯：现在它只是搜索的算力闸门——硬规则保留结构可行、前瞻窗可见、非注定违规、Q-time 安全等必要条件，S_res 只排序截断 TopB；是否真的预留交给树搜索的模拟比较，而非规则或概率（§5.8、§6.2.2）。
 
-**9.5 动作（分支）空间是否会过大。** 有风险，但当前代码已通过“宽触发 ROP + TopB reserve + TopK dispatch + no_op”控制分支因子，并强制 `iteration_count=max(len(root_edges), n_iter)`，保证小预算下每条 root edge 至少 rollout 一次。后续若接入 SAS delegate，可进一步把多个 dispatch edge 收缩为一个 `delegate_dispatch` 边，降低分支因子。
+**9.5 动作（分支）空间是否会过大。** 有风险，但当前代码已通过“宽触发 ROP + TopB reserve + no_op + 单个 delegate_dispatch”控制分支因子，并强制 `iteration_count=max(len(root_edges), n_iter)`，保证小预算下每条 root edge 至少 rollout 一次。旧 TopK dispatch 模式仍可通过 `--dispatch-delegate topk` 运行，用作消融；当前推荐实验路径为 `--dispatch-delegate rule` 和 `--dispatch-delegate sas` 的并排比较。
 
 **9.6 是否仍有奖励重复计数风险。** 不再有——本版预留不训练、无奖励通道，reserve 分支的反事实收益由 rollout 直接、精确地模拟得出（reserve 分支尊重 ledger、dispatch 分支不尊重，两条 O2 之差即收益，§5.5/§5.7），取代了上一版担心会与终局 O2 重复计数的近似 `r_cf`。须守住的命门改为"rollout 内部与树策略同源"（§5.7），否则 q̂ 失真。
 
 **9.7 是否可落地。** 可落地，但成本从训练期搬到推理期：每个 VC-MCTS 决策点要 clone driver/ledger 并跑若干条 reservation-aware rollout。当前已通过 `rollout_max_steps`、`max_decisions`、trace summary、`--workers` 并行和轻预算参数把 late_hi 完整验证控制在可运行范围内。后续缓解方向仍是 §5.11 所述的 Critic 叶子估值、子树复用、收紧 ROP/TopB、以及用 SAS delegate 减少 dispatch 分支。
 
-**9.8 当前仍需实验验证的边界。** 预留收益依赖实例中是否存在"晚到高优先级 Lot + 兼容机器稀缺 + 当前派工会挤占未来"的结构。当前 `late_hi` 已证明存在预留杠杆：轻预算 VC-MCTS 可把 baseline 的 Q-time violation count 从 20 降到 0，并使 O2 改善约 500+。但这仍是 `--noise` 未开启、rule rollout、单实例族的结果；下一步需要做三类验证：（1）开启 `--noise` 的鲁棒性；（2）不同到达强度/不同 qtime 紧度的实例族；（3）接入 SAS delegate 后与 rule delegate 的消融对比。若某实例中 reserve 边长期输给 dispatch，不应盲目堆搜索深度，而应先检查该实例是否真的具有预留杠杆。
+**9.8 当前仍需实验验证的边界。** 预留收益依赖实例中是否存在"晚到高优先级 Lot + 兼容机器稀缺 + 当前派工会挤占未来"的结构。当前 `late_hi` 已证明存在预留杠杆：deterministic 轻预算下 VC-MCTS 可把 baseline 的 Q-time violation count 从 20 降到 0；`VC + SAS delegate` 在 seed=0 上把 O2 从 1664.32 降到 955.83，明显优于 `VC + rule delegate` 的 1156.89。开启 `--noise` 后，seeds=2 的初步验证中 `VC + rule` 与 `VC + SAS` 都能把 Q-time violation 清零并完成 50/50，SAS 平均 O2 略优（1116.60 vs 1152.71），但 seed-level 有交叉。因此，下一步不是证明“能不能跑通”，而是扩大 seeds、增加不同到达强度/不同 qtime 紧度实例族，并判断当前 SAS checkpoint 是否需要针对 noise 场景重训或微调。若某实例中 reserve 边长期输给 dispatch，不应盲目堆搜索深度，而应先检查该实例是否真的具有预留杠杆。
