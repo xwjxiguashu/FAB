@@ -34,7 +34,7 @@ def _best_metric(edges, kind, metric):
 def _best_non_reserve(edges, metric):
     by_kind = {
         kind: _best_metric(edges, kind, metric)
-        for kind in ("dispatch", "no_op")
+        for kind in ("dispatch", "delegate_dispatch", "no_op")
     }
     candidates = {
         kind: value
@@ -108,8 +108,7 @@ def summarize_trace_records(records):
                 selected_reserve_lots.append(int(future_lot))
         else:
             reserve_lost_decisions += 1
-            winner_kind, _winner_o2 = _best_non_reserve(edges, "mean_o2")
-            winner_kind = winner_kind or selected_kind or "unknown"
+            winner_kind = selected_kind or "unknown"
             reserve_lost_to_counts[winner_kind] = (
                 reserve_lost_to_counts.get(winner_kind, 0) + 1
             )

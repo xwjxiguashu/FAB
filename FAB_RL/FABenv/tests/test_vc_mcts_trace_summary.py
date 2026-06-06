@@ -75,6 +75,52 @@ def test_summarize_trace_records_counts_reserve_availability_and_losses():
     assert summary["duplicate_selected_reserve_lots"] == [7]
 
 
+def test_reserve_lost_to_counts_uses_final_selected_action_after_noop_gating():
+    records = [
+        {
+            "time": 0.0,
+            "machine": 1,
+            "selected_action": {"kind": "delegate_dispatch"},
+            "edges": [
+                _edge("no_op", 0.0, 1.0, mean_qtime_total=0.0),
+                _edge("delegate_dispatch", 0.0, 8.0, mean_qtime_total=0.0),
+                _edge("reserve", 1.0, 10.0, visits=2, mean_qtime_total=1.0),
+            ],
+            "diagnostics": {
+                "reserve_was_available": True,
+                "reserve_was_selected": False,
+                "selected_kind": "delegate_dispatch",
+            },
+        },
+    ]
+
+    summary = summarize_trace_records(records)
+
+    assert summary["selected_counts"] == {"delegate_dispatch": 1}
+    assert summary["reserve_lost_decisions"] == 1
+    assert summary["reserve_lost_to_counts"] == {"delegate_dispatch": 1}
+
+
+def test_delegate_dispatch_is_included_in_best_non_reserve_gaps():
+    records = [
+        {
+            "time": 0.0,
+            "machine": 1,
+            "selected_action": {"kind": "reserve", "future_lot": 8},
+            "edges": [
+                _edge("no_op", 0.0, 20.0, mean_qtime_total=0.0),
+                _edge("delegate_dispatch", 0.0, 7.0, mean_qtime_total=0.0),
+                _edge("reserve", 0.0, 10.0, visits=2, mean_qtime_total=0.0),
+            ],
+            "diagnostics": {"reserve_was_available": True, "reserve_was_selected": True},
+        },
+    ]
+
+    summary = summarize_trace_records(records)
+
+    assert summary["reserve_o2_gap_vs_best_non_reserve_avg"] == 3.0
+
+
 def test_read_jsonl_trace_skips_blank_lines(tmp_path):
     trace_path = tmp_path / "trace.jsonl"
     trace_path.write_text(
