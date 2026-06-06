@@ -167,6 +167,7 @@ def run_rule_episode_with_reservations(
     ledger=None,
     strategy="FIFO",
     max_steps=None,
+    dispatch_delegate=None,
 ):
     """Run a rule episode while honoring a reservation ledger."""
     if ledger is None:
@@ -206,7 +207,14 @@ def run_rule_episode_with_reservations(
 
         machine = driver.select_next_machine(machines)
         decision = driver.build_decision(machine)
-        action_index = driver._rule_action_index(decision.pool, strategy)
+        if dispatch_delegate is None:
+            action_index = driver._rule_action_index(decision.pool, strategy)
+        else:
+            action_index = dispatch_delegate.select_action_index(
+                driver,
+                machine,
+                pool=decision.pool,
+            )
         if action_index is None:
             driver.consecutive_failed_actions += 1
             driver.failed_actions_per_episode += 1

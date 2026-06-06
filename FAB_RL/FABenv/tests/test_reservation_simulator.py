@@ -1,5 +1,6 @@
 from phase2_sas_driver import Phase2EpisodeDriver
 from phase2_sas_observation import Phase2ObservationEncoder
+from dispatch_delegate import RuleDispatchDelegate
 from reservation_ledger import ReservationLedger
 from reservation_simulator import (
     finalize_reservation_ledger,
@@ -46,6 +47,23 @@ def test_forced_reservation_consumes_target_lot_when_it_arrives(small_encoder):
     assert lot2_rows.shape[0] == 1
     assert int(lot2_rows[0, 1]) == 1
     assert not ledger.is_reserved(1)
+
+
+def test_reservation_rollout_accepts_dispatch_delegate(small_encoder):
+    env = ResourceCalendarEnv(small_encoder, top_k=8, w_lookahead=4.0)
+    env.reset()
+    driver = _driver(env)
+    driver.reset_episode()
+
+    summary = run_rule_episode_with_reservations(
+        driver,
+        strategy="SPT",
+        dispatch_delegate=RuleDispatchDelegate(strategy="FIFO"),
+        max_steps=200,
+    )
+
+    assert summary["completed_lots"] == 4
+    assert summary["termination_reason"] == "all_lots_completed"
 
 
 def test_rollout_comparison_rejects_qtime_gain_when_priority_wait_regresses():

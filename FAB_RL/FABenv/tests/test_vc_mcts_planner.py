@@ -1,6 +1,7 @@
 import json
 from pathlib import Path
 
+from dispatch_delegate import RuleDispatchDelegate
 from phase2_sas_driver import Phase2EpisodeDriver
 from phase2_sas_observation import Phase2ObservationEncoder
 from reservation_ledger import ReservationLedger
@@ -201,6 +202,28 @@ def test_planner_builds_dispatch_and_noop_actions(small_encoder):
     assert all(a.machine == machine for a in actions if a.kind == "dispatch")
 
 
+def test_planner_builds_single_delegate_dispatch_action(small_encoder):
+    env = ResourceCalendarEnv(small_encoder, top_k=8, w_lookahead=4.0)
+    driver = _driver(env)
+    driver.reset_episode()
+    ledger = ReservationLedger()
+    machine = driver.select_next_machine(driver.get_dispatchable_machines())
+    planner = VCMCTSPlanner(
+        VCMCTSConfig(
+            n_iter=1,
+            top_k_dispatch=3,
+            top_b_reserve=0,
+            use_delegate_dispatch=True,
+        ),
+        dispatch_delegate=RuleDispatchDelegate(strategy="FIFO"),
+    )
+
+    actions = planner.build_root_actions(driver, ledger, machine)
+
+    assert [action.kind for action in actions].count("delegate_dispatch") == 1
+    assert [action.kind for action in actions].count("dispatch") == 0
+
+
 def test_planner_builds_reserve_actions_from_rop(small_encoder):
     env = ResourceCalendarEnv(small_encoder, top_k=8, w_lookahead=4.0)
     driver = _driver(env)
@@ -294,6 +317,32 @@ def test_vc_mcts_episode_completes_small_instance(small_encoder):
     assert summary["completed_lots"] == 4
     assert summary["vc_mcts_decisions"] > 0
     assert summary["active_reservations"] == 0
+
+
+def test_vc_mcts_episode_completes_with_rule_dispatch_delegate(small_encoder):
+    env = ResourceCalendarEnv(small_encoder, top_k=8, w_lookahead=4.0)
+    driver = _driver(env, max_steps=200)
+    driver.reset_episode()
+    delegate = RuleDispatchDelegate(strategy="FIFO")
+    planner = VCMCTSPlanner(
+        VCMCTSConfig(
+            n_iter=4,
+            top_k_dispatch=2,
+            top_b_reserve=1,
+            use_delegate_dispatch=True,
+        ),
+        dispatch_delegate=delegate,
+    )
+
+    summary = run_vc_mcts_reservation_episode(
+        driver,
+        planner=planner,
+        max_steps=200,
+        dispatch_delegate=delegate,
+    )
+
+    assert summary["completed_lots"] == 4
+    assert summary["dispatch_delegate"] == "rule:FIFO"
 
 
 def test_vc_mcts_episode_dispatches_ready_reserved_target(small_encoder):
@@ -408,6 +457,26 @@ def test_vc_mcts_probe_can_skip_oracle_and_write_trace(tmp_path):
     summary = json.loads(summary_path.read_text(encoding="utf-8"))
     assert summary["decisions"] == 1
     assert summary["reserve_available_decisions"] == 1
+
+
+def test_vc_mcts_probe_supports_rule_dispatch_delegate():
+    row = run_vc_mcts_seed(
+        instance="small",
+        seed=0,
+        strategy="FIFO",
+        w_lookahead=4.0,
+        top_b=1,
+        top_k_dispatch=2,
+        n_iter=2,
+        max_steps=200,
+        skip_oracle=True,
+        rollout_max_steps=20,
+        dispatch_delegate="rule",
+    )
+
+    assert row["oracle"] is None
+    assert row["vc_mcts"]["completed_lots"] == 4.0
+    assert row["vc_mcts"]["dispatch_delegate"] == "rule:FIFO"
 
 
 def test_vc_mcts_probe_seed_output_path_inserts_seed_before_suffix():

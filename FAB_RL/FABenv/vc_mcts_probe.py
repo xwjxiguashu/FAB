@@ -15,6 +15,7 @@ for _thread_var in (
 
 import multiprocessing as mp
 
+from dispatch_delegate import RuleDispatchDelegate, load_sas_policy_delegate
 from oracle_reservation_probe import (
     _driver,
     _encoder_factory,
@@ -31,6 +32,28 @@ from vc_mcts_planner import (
     run_vc_mcts_reservation_episode,
 )
 from vc_mcts_trace_summary import summarize_trace_file
+
+
+def _make_dispatch_delegate(
+    mode,
+    strategy,
+    sas_checkpoint=None,
+    sas_stochastic=False,
+):
+    if mode in (None, "topk"):
+        return None, False
+    fallback = RuleDispatchDelegate(strategy=strategy)
+    if mode == "rule":
+        return fallback, True
+    if mode == "sas":
+        if not sas_checkpoint:
+            raise ValueError("--sas-checkpoint is required when --dispatch-delegate=sas")
+        return load_sas_policy_delegate(
+            sas_checkpoint,
+            stochastic=sas_stochastic,
+            fallback_delegate=fallback,
+        ), True
+    raise ValueError(f"unknown dispatch delegate mode: {mode!r}")
 
 
 def _seed_output_path(path, seed):
@@ -65,6 +88,9 @@ def run_seed(
     trace_out=None,
     trace_summary_out=None,
     progress_every=0,
+    dispatch_delegate="topk",
+    sas_checkpoint=None,
+    sas_stochastic=False,
 ):
     factory = _encoder_factory(instance)
 
@@ -113,6 +139,12 @@ def run_seed(
     )
     mcts_driver = _driver(mcts_env, max_steps)
     mcts_driver.reset_episode()
+    delegate, use_delegate_dispatch = _make_dispatch_delegate(
+        dispatch_delegate,
+        strategy,
+        sas_checkpoint=sas_checkpoint,
+        sas_stochastic=sas_stochastic,
+    )
     planner = VCMCTSPlanner(
         VCMCTSConfig(
             n_iter=n_iter,
@@ -120,7 +152,9 @@ def run_seed(
             top_b_reserve=top_b,
             rollout_strategy=strategy,
             rollout_max_steps=rollout_max_steps or max_steps,
-        )
+            use_delegate_dispatch=use_delegate_dispatch,
+        ),
+        dispatch_delegate=delegate,
     )
     trace_file = None
     try:
@@ -136,6 +170,7 @@ def run_seed(
             stop_after_reserve_selected=stop_after_reserve_selected,
             trace_writer=trace_file,
             progress_every=progress_every,
+            dispatch_delegate=delegate,
         )
     finally:
         if trace_file is not None:
@@ -201,6 +236,9 @@ def _run_seed_job(args):
         trace_out,
         trace_summary_out,
         progress_every,
+        dispatch_delegate,
+        sas_checkpoint,
+        sas_stochastic,
     ) = args
     t0 = time.time()
     row = run_seed(
@@ -221,6 +259,9 @@ def _run_seed_job(args):
         trace_out=trace_out,
         trace_summary_out=trace_summary_out,
         progress_every=progress_every,
+        dispatch_delegate=dispatch_delegate,
+        sas_checkpoint=sas_checkpoint,
+        sas_stochastic=sas_stochastic,
     )
     row["_elapsed_s"] = time.time() - t0
     return row
@@ -260,6 +301,9 @@ def main(
     trace_summary_out=None,
     progress_every=0,
     workers=1,
+    dispatch_delegate="topk",
+    sas_checkpoint=None,
+    sas_stochastic=False,
 ):
     n = int(seeds)
     workers = max(1, int(workers))
@@ -295,6 +339,9 @@ def main(
                 seed_trace_out,
                 seed_summary_out,
                 progress_every,
+                dispatch_delegate,
+                sas_checkpoint,
+                sas_stochastic,
             )
         )
 
@@ -350,6 +397,13 @@ def _cli():
     parser.add_argument("--trace-out", default=None)
     parser.add_argument("--trace-summary-out", default=None)
     parser.add_argument("--workers", type=int, default=1)
+    parser.add_argument(
+        "--dispatch-delegate",
+        choices=["topk", "rule", "sas"],
+        default="topk",
+    )
+    parser.add_argument("--sas-checkpoint", default=None)
+    parser.add_argument("--sas-stochastic", action="store_true")
     parser.add_argument("--noise", action="store_true")
     args = parser.parse_args()
     main(
@@ -371,6 +425,9 @@ def _cli():
         trace_summary_out=args.trace_summary_out,
         progress_every=args.progress_every,
         workers=args.workers,
+        dispatch_delegate=args.dispatch_delegate,
+        sas_checkpoint=args.sas_checkpoint,
+        sas_stochastic=args.sas_stochastic,
     )
 
 

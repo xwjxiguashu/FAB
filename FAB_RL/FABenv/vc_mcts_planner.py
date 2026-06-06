@@ -1,8 +1,8 @@
 """Online VC-MCTS reservation planner.
 
 This first slice is a root-level MCTS planner: build root actions, evaluate
-branches with reservation-aware rollouts, and choose by visit count with a
-lexicographic objective tie-break.
+branches with reservation-aware rollouts, and choose with a lexicographic
+objective tie-break.
 """
 from dataclasses import dataclass, field
 import json
@@ -34,6 +34,7 @@ class VCMCTSConfig:
     reservation_ttl: float = 1.0
     rollout_strategy: str = "FIFO"
     rollout_max_steps: int | None = None
+    use_delegate_dispatch: bool = False
 
 
 @dataclass(frozen=True)
@@ -118,7 +119,10 @@ class VCMCTSDecisionTrace:
     def to_dict(self):
         edges = [edge.to_dict() for edge in self.edge_stats]
         reserve_edges = [edge for edge in edges if edge["kind"] == "reserve"]
-        dispatch_edges = [edge for edge in edges if edge["kind"] == "dispatch"]
+        dispatch_edges = [
+            edge for edge in edges
+            if edge["kind"] in ("dispatch", "delegate_dispatch")
+        ]
         noop_edges = [edge for edge in edges if edge["kind"] == "no_op"]
 
         def best_metric(items, metric):
@@ -174,9 +178,10 @@ def objective_to_score(objective, config):
 
 
 class VCMCTSPlanner:
-    def __init__(self, config=None, rollout_evaluator=None):
+    def __init__(self, config=None, rollout_evaluator=None, dispatch_delegate=None):
         self.config = config if config is not None else VCMCTSConfig()
         self.rollout_evaluator = rollout_evaluator
+        self.dispatch_delegate = dispatch_delegate
 
     def plan(self, driver, ledger, machine):
         current_time = float(driver.env.current_time)
@@ -256,27 +261,51 @@ class VCMCTSPlanner:
         actions = [VCMCTSAction(kind="no_op", machine=machine, prior=0.05)]
 
         pool = driver.env.build_candidate_pool(machine)
-        dispatch = []
-        for index, action in enumerate(pool.actions):
-            if not bool(pool.action_mask[index]):
-                continue
-            if getattr(action, "is_padding", False) or getattr(action, "is_wait", False):
-                continue
-            if int(action.ppid) == 0:
-                continue
-            dispatch.append((float(getattr(action, "score", 0.0)), index, action))
-        dispatch.sort(key=lambda row: (-row[0], row[1]))
-        for score, index, action in dispatch[: self.config.top_k_dispatch]:
-            actions.append(
-                VCMCTSAction(
-                    kind="dispatch",
-                    machine=machine,
-                    action_index=int(index),
-                    lot=int(action.lot),
-                    ppid=int(action.ppid),
-                    prior=max(1e-6, float(score) + 1.0),
+        if self.config.use_delegate_dispatch:
+            action_index = None
+            if self.dispatch_delegate is not None:
+                action_index = self.dispatch_delegate.select_action_index(
+                    driver,
+                    machine,
+                    pool=pool,
                 )
-            )
+            if action_index is not None:
+                action = pool.actions[int(action_index)]
+                actions.append(
+                    VCMCTSAction(
+                        kind="delegate_dispatch",
+                        machine=machine,
+                        action_index=int(action_index),
+                        lot=int(action.lot),
+                        ppid=int(action.ppid),
+                        prior=max(
+                            1e-6,
+                            float(getattr(action, "score", 0.0)) + 1.0,
+                        ),
+                    )
+                )
+        else:
+            dispatch = []
+            for index, action in enumerate(pool.actions):
+                if not bool(pool.action_mask[index]):
+                    continue
+                if getattr(action, "is_padding", False) or getattr(action, "is_wait", False):
+                    continue
+                if int(action.ppid) == 0:
+                    continue
+                dispatch.append((float(getattr(action, "score", 0.0)), index, action))
+            dispatch.sort(key=lambda row: (-row[0], row[1]))
+            for score, index, action in dispatch[: self.config.top_k_dispatch]:
+                actions.append(
+                    VCMCTSAction(
+                        kind="dispatch",
+                        machine=machine,
+                        action_index=int(index),
+                        lot=int(action.lot),
+                        ppid=int(action.ppid),
+                        prior=max(1e-6, float(score) + 1.0),
+                    )
+                )
 
         opportunities = detect_reservation_opportunities(
             driver.env,
@@ -309,6 +338,7 @@ class VCMCTSPlanner:
             ledger=branch_ledger,
             strategy=self.config.rollout_strategy,
             max_steps=self.config.rollout_max_steps or branch_driver.max_steps,
+            dispatch_delegate=self.dispatch_delegate,
         )
         metrics = schedule_metrics_with_priority_wait(branch_driver.env.encoder, branch_driver.env)
         return VCMCTSObjective(
@@ -332,9 +362,19 @@ class VCMCTSPlanner:
                 reason="vc_mcts",
             )
             return
-        if action.kind == "dispatch":
+        if action.kind in ("dispatch", "delegate_dispatch"):
             pool = driver.env.build_candidate_pool(action.machine)
-            driver.step_with_action(action.machine, action.action_index, pool=pool)
+            action_index = action.action_index
+            if action.kind == "delegate_dispatch" and self.dispatch_delegate is not None:
+                action_index = self.dispatch_delegate.select_action_index(
+                    driver,
+                    action.machine,
+                    pool=pool,
+                )
+            if action_index is None:
+                advance_to_next_event_with_ledger(driver, ledger)
+                return
+            driver.step_with_action(action.machine, action_index, pool=pool)
             return
         raise ValueError(f"unknown VC-MCTS action kind: {action.kind!r}")
 
@@ -393,10 +433,12 @@ def run_vc_mcts_reservation_episode(
     stop_after_reserve_selected=None,
     trace_writer=None,
     progress_every=0,
+    dispatch_delegate=None,
 ):
     """Run an online VC-MCTS episode while honoring existing reservations."""
     planner = planner if planner is not None else VCMCTSPlanner()
     ledger = ledger if ledger is not None else ReservationLedger()
+    dispatch_delegate = dispatch_delegate or getattr(planner, "dispatch_delegate", None)
     steps = 0
     decisions = 0
     reserve_available_seen = 0
@@ -484,9 +526,24 @@ def run_vc_mcts_reservation_episode(
                 break
             steps += 1
             continue
-        if action.kind == "dispatch":
+        if action.kind in ("dispatch", "delegate_dispatch"):
             pool = driver.env.build_candidate_pool(action.machine)
-            result = driver.step_with_action(action.machine, action.action_index, pool=pool)
+            action_index = action.action_index
+            if action.kind == "delegate_dispatch" and dispatch_delegate is not None:
+                action_index = dispatch_delegate.select_action_index(
+                    driver,
+                    action.machine,
+                    pool=pool,
+                )
+            if action_index is None:
+                next_time = advance_to_next_event_with_ledger(driver, ledger)
+                if next_time is None:
+                    if not driver.termination_reason:
+                        driver.termination_reason = "no_future_event"
+                    break
+                steps += 1
+                continue
+            result = driver.step_with_action(action.machine, action_index, pool=pool)
             episode_reward += float(result.reward)
             steps += 1
             continue
@@ -499,4 +556,10 @@ def run_vc_mcts_reservation_episode(
     summary["reserve_available_decisions"] = int(reserve_available_seen)
     summary["reserve_selected_decisions"] = int(reserve_selected_seen)
     summary["active_reservations"] = len(ledger.reserved_machines())
+    if dispatch_delegate is not None:
+        summary["dispatch_delegate"] = getattr(
+            dispatch_delegate,
+            "label",
+            dispatch_delegate.__class__.__name__,
+        )
     return summary
