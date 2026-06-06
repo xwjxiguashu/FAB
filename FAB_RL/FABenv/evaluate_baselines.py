@@ -29,7 +29,11 @@ for _v in ("OMP_NUM_THREADS", "MKL_NUM_THREADS", "OPENBLAS_NUM_THREADS",
 
 import numpy as np
 
-from problem_instances import build_small_encoder, build_pressure_test_encoder
+from problem_instances import (
+    build_small_encoder,
+    build_pressure_test_encoder,
+    build_late_hi_encoder,
+)
 from rl_environment import ResourceCalendarEnv, RewardConfig
 from phase2_sas_observation import Phase2ObservationEncoder
 from phase2_sas_driver import Phase2EpisodeDriver
@@ -41,6 +45,7 @@ DEFAULT_RULES = ("FIFO", "SPT", "EDD", "CR", "ATC")
 ENCODER_FACTORIES = {
     "small": build_small_encoder,
     "pressure": build_pressure_test_encoder,
+    "late_hi": build_late_hi_encoder,
 }
 
 #: 指标键 → (在 evaluate_objectives 向量中的索引, 是否取负)。
@@ -372,7 +377,7 @@ def main(instance="small", seeds=5, strategies=DEFAULT_RULES, no_noise=False,
          checkpoint=None, checkpoints=None, out=None, workers=1,
          priority_mode="soft", priority_min_gap=0.0, markdown_out=None):
     """多 seed 基线 + RL 评测。可直接以关键字参数调用 (VSCode 点 Run)，CLI 见 _cli()。"""
-    encoder_factory = build_pressure_test_encoder if instance == "pressure" else build_small_encoder
+    encoder_factory = ENCODER_FACTORIES.get(instance, build_small_encoder)
     if isinstance(strategies, str):
         strategies = tuple(s.strip() for s in strategies.split(",") if s.strip())
     else:
@@ -425,7 +430,7 @@ def main(instance="small", seeds=5, strategies=DEFAULT_RULES, no_noise=False,
 
 def _cli():
     parser = argparse.ArgumentParser(description="派工规则基线 + 多 seed 评测")
-    parser.add_argument("--instance", choices=["small", "pressure"], default="small")
+    parser.add_argument("--instance", choices=["small", "pressure", "late_hi"], default="small")
     parser.add_argument("--seeds", type=int, default=5, help="seed 数量 (0..N-1)")
     parser.add_argument("--strategies", default=",".join(DEFAULT_RULES),
                         help="逗号分隔的规则名")

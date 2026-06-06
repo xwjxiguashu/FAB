@@ -384,7 +384,38 @@ def build_small_encoder():
     return encoder
 
 
-def build_pressure_test_encoder(seed=2026, qtime_limit=3.0, arrival_mean_gap=0.6):
+def _late_hi_priorities(arrival_times, rng, target_corr=0.97):
+    """高优先级晚到 (late_hi) 的 priority 构造 (报告4 §9.8)。
+
+    priority = scale(arrival) + 噪声; 噪声幅度按目标 Pearson 相关系数设定:
+    corr = 1/sqrt(1+k^2) ⇒ k = sqrt(1/corr^2 - 1)。仿射缩放到 [0,10] 不改变相关性。
+    只有"高优先级 Lot 晚到"这种结构才给预留留有杠杆 (否则 oracle 无从区分
+    "预留没用"与"实例没给预留发挥空间")。
+    """
+    lots = sorted(arrival_times)
+    signal = np.array([arrival_times[l] for l in lots], dtype=float)
+    signal_std = float(np.std(signal))
+    target_corr = float(min(max(target_corr, 1e-3), 0.999))
+    k = float(np.sqrt(1.0 / (target_corr ** 2) - 1.0))
+    if signal_std > 0.0:
+        noise = rng.normal(0.0, k * signal_std, size=len(signal))
+    else:
+        noise = np.zeros(len(signal))
+    raw = signal + noise
+    lo = float(np.min(raw))
+    hi = float(np.max(raw))
+    span = hi - lo if hi > lo else 1.0
+    scaled = (raw - lo) / span * 10.0
+    return {lot: float(scaled[i]) for i, lot in enumerate(lots)}
+
+
+def build_pressure_test_encoder(
+    seed=2026,
+    qtime_limit=3.0,
+    arrival_mean_gap=0.6,
+    priority_mode="random",
+    priority_arrival_corr=0.97,
+):
     """构建 50 Lot × 10 机台的压力测试实例。
 
     参数:
@@ -393,7 +424,8 @@ def build_pressure_test_encoder(seed=2026, qtime_limit=3.0, arrival_mean_gap=0.6
       - 处理时间: 1.5 + 0.2*stage + U(0, 2.5), 每步 2-4 个备选资源
       - 到达时间: Poisson 到达 (指数间隔, 均值 arrival_mean_gap), lot1 在 t=0 (错峰)
       - 交货期: arrival + 180 + 0.5*lot_id
-      - 优先级: U(0, 10)
+      - 优先级: priority_mode="random" → U(0, 10) (与到达无关, 默认);
+                priority_mode="late_hi" → 与到达高度正相关 (高优先级晚到, 报告4 §9.8)
       - 配方: 5 种配方循环分配
       - 机台组: 每 5 台一组
       - 阶段间 Q-time: 对 (1,2) 与 (2,3) 设上限 qtime_limit (材料队列时间约束)
@@ -523,11 +555,19 @@ def build_pressure_test_encoder(seed=2026, qtime_limit=3.0, arrival_mean_gap=0.6
         for ppid in feasible_ppids[(lot, machine)]
         for (from_stage, to_stage) in ((1, 2), (2, 3))
     }
-    # 随机优先级 [0, 10)
-    encoder.priorities = {
-        lot: float(rng.uniform(0.0, 10.0))
-        for lot in range(1, num_lots + 1)
-    }
+    # 优先级: "random" (默认, U(0,10), 与到达无关) 或
+    #          "late_hi" (与到达高度正相关, 高优先级晚到, 报告4 §9.8 go/no-go 用)
+    if priority_mode == "late_hi":
+        encoder.priorities = _late_hi_priorities(
+            arrival_times, rng, target_corr=priority_arrival_corr
+        )
+    elif priority_mode == "random":
+        encoder.priorities = {
+            lot: float(rng.uniform(0.0, 10.0))
+            for lot in range(1, num_lots + 1)
+        }
+    else:
+        raise ValueError(f"unknown priority_mode: {priority_mode!r}")
     # 5 种配方循环
     encoder.recipe = {
         lot: f"R{1 + ((lot - 1) % 5)}"
@@ -548,6 +588,28 @@ def build_pressure_test_encoder(seed=2026, qtime_limit=3.0, arrival_mean_gap=0.6
         for machine in range(1, num_machines + 1)
     }
     return encoder
+
+
+def build_late_hi_encoder(
+    seed=2026,
+    qtime_limit=3.0,
+    arrival_mean_gap=0.6,
+    priority_arrival_corr=0.97,
+):
+    """高优先级晚到的压力实例 (报告4 §9.8 的 late_hi)。
+
+    与 build_pressure_test_encoder 同骨架, 但 priority 与到达时间高度正相关
+    (corr≈priority_arrival_corr): 高优先级 Lot 倾向晚到。这是 oracle 预留上界
+    go/no-go 验证 (§6.2.3 阶段 0) 必须使用的区分实例 —— 只有这种"晚到高优先级 +
+    当前派工会挤占未来"的结构才给选择性预留留出杠杆。
+    """
+    return build_pressure_test_encoder(
+        seed=seed,
+        qtime_limit=qtime_limit,
+        arrival_mean_gap=arrival_mean_gap,
+        priority_mode="late_hi",
+        priority_arrival_corr=priority_arrival_corr,
+    )
 
 
 def format_objectives(objectives):
