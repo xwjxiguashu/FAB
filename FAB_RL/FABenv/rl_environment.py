@@ -547,6 +547,12 @@ class ResourceCalendarEnv:
         self._noise_rng = np.random.default_rng(noise_seed)
         self.priority_filter_mode = str(priority_filter_mode)
         self.priority_min_gap = float(priority_min_gap)
+        # Q-time mask 口径: "aggregate" (现状: 单一聚合 deadline 代理)、
+        # "chain" (按实际 q_time_limits 阶段链单次 dry-run 自检)、或
+        # "chain_joint" (K 次独立带噪 dry-run 估 P(链上任一窗违规), 联合机会约束)。
+        self.qtime_mask_mode = "aggregate"
+        self.qtime_chain_mc = 8          # chain_joint 的蒙特卡洛采样数
+        self.qtime_chain_threshold = 0.0  # mask 条件: 违规样本占比 > 此阈值 (0=任一即屏蔽)
 
         # is_doomed 缓存：键 lot → bool，时间推进/重置时失效（避免 mask 内 O(n²) 重算）
         self._doomed_cache = {}
@@ -1083,6 +1089,72 @@ class ResourceCalendarEnv:
         cache[lot] = doomed
         return doomed
 
+    def _qtime_chain_mask(self, machine, candidate_actions):
+        """Chain-aware Q-time mask（方向: Q-time 链）。
+
+        现状 mask 只比"单一聚合 deadline 代理 vs 总完成 μ"，从不看实际的阶段间
+        q_time_limits 链 (1,2)/(2,3)。本版改为对每个候选做非破坏式 dry-run，用
+        真正的 compute_q_time_violation 评估其阶段链窗口——即"屏蔽所筛 = 实际所罚"。
+        doomed lot 仍不作屏蔽依据（防死锁，报告 §3.2）。
+        """
+        mask = np.ones(len(candidate_actions), dtype=bool)
+        if len(getattr(self.encoder, "q_time_limits", {})) == 0:
+            return mask
+        for i, action in enumerate(candidate_actions):
+            action = self._coerce_action(action)
+            if action.is_padding or action.is_wait or int(action.ppid) == 0:
+                continue
+            if self.is_doomed(int(action.lot)):
+                continue
+            try:
+                res = self.dry_run_action(action)
+            except Exception:
+                continue
+            if not res.success or np.asarray(res.wafer_schedule).size == 0:
+                continue
+            count, _total = self.encoder.compute_q_time_violation(res.wafer_schedule)
+            if float(count) > 0.0:
+                mask[i] = False
+        return mask
+
+    def _qtime_chain_joint_mask(self, machine, candidate_actions):
+        """Chain-aware 联合机会约束 mask（方向: Q-time 链 chance-constraint 版）。
+
+        对每个候选做 K 次【独立带噪】非破坏式 dry-run，用真实 compute_q_time_violation
+        逐次判断"阶段链 (1,2)/(2,3) 上是否任一窗违规"（联合 = 任一窗），估计违规概率
+        p̂ = 违规样本数 / 有效样本数；p̂ > threshold 则屏蔽。即把 chain-μ 的单次确定判
+        升级为"违规概率 ≤ ε"的联合机会约束，攻 chain-μ 漏掉的噪声尾部。
+        doomed lot 仍不作屏蔽依据（防死锁）。
+        """
+        mask = np.ones(len(candidate_actions), dtype=bool)
+        if len(getattr(self.encoder, "q_time_limits", {})) == 0:
+            return mask
+        k_mc = int(getattr(self, "qtime_chain_mc", 8))
+        threshold = float(getattr(self, "qtime_chain_threshold", 0.0))
+        for i, action in enumerate(candidate_actions):
+            action = self._coerce_action(action)
+            if action.is_padding or action.is_wait or int(action.ppid) == 0:
+                continue
+            if self.is_doomed(int(action.lot)):
+                continue
+            rng = np.random.default_rng((int(action.lot), int(action.ppid), int(self.noise_seed or 0)))
+            violations = 0
+            valid = 0
+            for _ in range(k_mc):
+                try:
+                    res = self.dry_run_action(action, noise_rng=rng)
+                except Exception:
+                    continue
+                if not res.success or np.asarray(res.wafer_schedule).size == 0:
+                    continue
+                valid += 1
+                count, _total = self.encoder.compute_q_time_violation(res.wafer_schedule)
+                if float(count) > 0.0:
+                    violations += 1
+            if valid > 0 and (violations / valid) > threshold:
+                mask[i] = False
+        return mask
+
     def qtime_safe_mask(self, machine, candidate_actions, z_eps=None):
         """Q-time 机会约束 mask（报告 §3.2）。
 
@@ -1099,6 +1171,12 @@ class ResourceCalendarEnv:
           可行 (machine, ppid) 组合，visible_lots 检查框架已就位，留作后续完整版扩展点。
         """
         from lower_layer_estimator import estimate, is_qtime_violated_probabilistically
+
+        mask_mode = getattr(self, "qtime_mask_mode", "aggregate")
+        if mask_mode == "chain":
+            return self._qtime_chain_mask(machine, candidate_actions)
+        if mask_mode == "chain_joint":
+            return self._qtime_chain_joint_mask(machine, candidate_actions)
 
         if z_eps is None:
             z_eps = float(getattr(self.encoder, "z_eps", 2.05))
@@ -1179,11 +1257,12 @@ class ResourceCalendarEnv:
 
     # ---- Action 试算与提交 ----
 
-    def dry_run_action(self, action):
+    def dry_run_action(self, action, noise_rng=None):
         """在状态副本上模拟执行一个动作 (不修改真实环境)。
 
         返回 DryRunResult，包含试算的 lot_schedule, wafer_schedule 和状态副本。
         padding 动作 success=False；wait 动作 success=True 但 schedule 为空。
+        noise_rng: None=均值路径，不采样噪声；传 Generator 则独立采样。
         """
         action = self._coerce_action(action)
         dry_state = self._copy_state(self.state)
@@ -1212,6 +1291,7 @@ class ResourceCalendarEnv:
             lot_schedule, wafer_schedule, state = self._simulate_action(
                 action,
                 dry_state,
+                noise_rng=noise_rng,
             )
             machine_intervals = [
                 (int(row[1]), float(row[3]), float(row[4]))
@@ -1296,6 +1376,7 @@ class ResourceCalendarEnv:
             dry_run_result is not None
             and dry_run_result.success
             and dry_run_result.action == action
+            and not self.process_noise_enabled
         )
 
         # 记录提交前状态用于回滚
@@ -1977,8 +2058,14 @@ class ResourceCalendarEnv:
 
         return conflict_count
 
-    def _simulate_action(self, action, state):
-        """Commit-path schedule wrapper around lower-layer calendar scheduling."""
+    def _simulate_action(self, action, state, noise_rng=False):
+        """Commit-path schedule wrapper around lower-layer calendar scheduling.
+
+        ``noise_rng=False`` (默认) 用环境共享的 _noise_rng（受 process_noise_enabled
+        门控）——commit 行为。``noise_rng=None`` 走均值路径，不采样噪声，供 dry-run
+        和候选池构建使用。传入一个 Generator 则改用它（且不触动共享 rng），供
+        chance-constraint mask 做独立多采样用。
+        """
         from lower_layer_scheduler import schedule_on_calendar
 
         lot = int(action.lot)
@@ -1988,7 +2075,12 @@ class ResourceCalendarEnv:
             self.current_time,
             float(self.encoder.arrival_times[lot]),
         )
-        rng = self._noise_rng if self.process_noise_enabled else None
+        if noise_rng is False:
+            rng = self._noise_rng if self.process_noise_enabled else None
+        elif noise_rng is None:
+            rng = None
+        else:
+            rng = noise_rng
         res = schedule_on_calendar(
             lot,
             machine,

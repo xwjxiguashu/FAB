@@ -26,13 +26,18 @@ from phase2_ppo_buffer import MULTIHEAD_CHANNELS, MultiHeadRolloutStep
 from phase2_sas_driver import Phase2EpisodeDriver
 from phase2_sas_observation import Phase2ObservationEncoder
 from phase2_sas_policy import Phase2SASMultiHeadActorCritic
-from problem_instances import build_pressure_test_encoder, build_small_encoder
+from problem_instances import (
+    build_late_hi_encoder,
+    build_pressure_test_encoder,
+    build_small_encoder,
+)
 from rl_environment import ResourceCalendarEnv, RewardConfig, RewardVectorConfig
 
 
 ENCODER_FACTORIES = {
     "small": build_small_encoder,
     "pressure": build_pressure_test_encoder,
+    "late_hi": build_late_hi_encoder,
 }
 
 # 每个 worker 进程的常驻对象 (spawn 后由 _init_worker 填充)。

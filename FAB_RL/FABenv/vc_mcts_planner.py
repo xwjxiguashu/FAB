@@ -4,7 +4,7 @@ This first slice is a root-level MCTS planner: build root actions, evaluate
 branches with reservation-aware rollouts, and choose with a lexicographic
 objective tie-break.
 """
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 import json
 import math
 import sys
@@ -35,6 +35,13 @@ class VCMCTSConfig:
     rollout_strategy: str = "FIFO"
     rollout_max_steps: int | None = None
     use_delegate_dispatch: bool = False
+    prior_source: str = "heuristic"
+    policy_reserve_prior: float = 0.15
+    use_leaf_value: bool = False
+    leaf_rollout_depth: int = 8
+    arrival_prob_weighting: bool = False
+    arrival_prob_decay: float = 1.0
+    lookahead_window: float = 4.0
 
 
 @dataclass(frozen=True)
@@ -43,6 +50,7 @@ class VCMCTSObjective:
     priority_weighted_wait: float
     avg_utilization: float
     qtime_violation_total: float = 0.0
+    is_leaf_bootstrap: bool = False
 
 
 @dataclass(frozen=True)
@@ -77,6 +85,7 @@ class VCMCTSEdgeStats:
     total_qtime_severity: float = 0.0
     total_o2: float = 0.0
     total_util: float = 0.0
+    leaf_bootstrap_visits: int = 0
 
     def record(self, objective):
         self.visits += 1
@@ -84,6 +93,8 @@ class VCMCTSEdgeStats:
         self.total_qtime_severity += float(objective.qtime_violation_total)
         self.total_o2 += float(objective.priority_weighted_wait)
         self.total_util += float(objective.avg_utilization)
+        if bool(getattr(objective, "is_leaf_bootstrap", False)):
+            self.leaf_bootstrap_visits += 1
 
     @property
     def mean_objective(self):
@@ -94,6 +105,7 @@ class VCMCTSEdgeStats:
             qtime_violation_total=self.total_qtime_severity / self.visits,
             priority_weighted_wait=self.total_o2 / self.visits,
             avg_utilization=self.total_util / self.visits,
+            is_leaf_bootstrap=bool(self.leaf_bootstrap_visits > 0),
         )
 
     def to_dict(self):
@@ -106,6 +118,8 @@ class VCMCTSEdgeStats:
             "mean_qtime_total": None if mean is None else float(mean.qtime_violation_total),
             "mean_o2": None if mean is None else float(mean.priority_weighted_wait),
             "mean_util": None if mean is None else float(mean.avg_utilization),
+            "leaf_bootstrap_visits": int(self.leaf_bootstrap_visits),
+            "mean_is_leaf_bootstrap": None if mean is None else bool(mean.is_leaf_bootstrap),
         }
 
 
@@ -177,11 +191,45 @@ def objective_to_score(objective, config):
     )
 
 
+def blend_objectives(p, arrive_obj, miss_obj):
+    """Probability-weighted blend of two objectives (方向2 最小验证).
+
+    ``p`` is the arrival probability of the reserved future lot. With prob ``p``
+    the lot arrives and the reserve branch (``arrive_obj``) is realized; with
+    prob ``1-p`` it does not, and the no-reserve alternative (``miss_obj``,
+    typically the best dispatch/no_op branch) is what actually happens — so the
+    reserve's *expected* value discounts toward the miss outcome as ``p`` drops.
+    """
+    q = 1.0 - float(p)
+    return VCMCTSObjective(
+        qtime_violation_count=p * arrive_obj.qtime_violation_count
+        + q * miss_obj.qtime_violation_count,
+        qtime_violation_total=p * arrive_obj.qtime_violation_total
+        + q * miss_obj.qtime_violation_total,
+        priority_weighted_wait=p * arrive_obj.priority_weighted_wait
+        + q * miss_obj.priority_weighted_wait,
+        avg_utilization=p * arrive_obj.avg_utilization
+        + q * miss_obj.avg_utilization,
+        is_leaf_bootstrap=bool(
+            arrive_obj.is_leaf_bootstrap or miss_obj.is_leaf_bootstrap
+        ),
+    )
+
+
 class VCMCTSPlanner:
-    def __init__(self, config=None, rollout_evaluator=None, dispatch_delegate=None):
+    def __init__(
+        self,
+        config=None,
+        rollout_evaluator=None,
+        dispatch_delegate=None,
+        prior_provider=None,
+        leaf_value=None,
+    ):
         self.config = config if config is not None else VCMCTSConfig()
         self.rollout_evaluator = rollout_evaluator
         self.dispatch_delegate = dispatch_delegate
+        self.prior_provider = prior_provider
+        self.leaf_value = leaf_value
 
     def plan(self, driver, ledger, machine):
         current_time = float(driver.env.current_time)
@@ -192,7 +240,7 @@ class VCMCTSPlanner:
             edge = self._select_edge(edges)
             objective = self.evaluate_action(driver, ledger, edge.action)
             edge.record(objective)
-        selected = self._choose_final_action(edges)
+        selected = self._choose_final_action(edges, current_time)
         return VCMCTSDecisionTrace(
             selected_action=selected.action,
             edge_stats=edges,
@@ -219,9 +267,46 @@ class VCMCTSPlanner:
 
         return max(edges, key=uct)
 
-    def _choose_final_action(self, edges):
+    def _arrival_prob(self, eta, now):
+        """Arrival probability of a future lot, decaying with ETA distance."""
+        if eta is None or not self.config.arrival_prob_weighting:
+            return 1.0
+        dist = max(0.0, float(eta) - float(now))
+        window = max(1e-9, float(self.config.lookahead_window))
+        return float(math.exp(-float(self.config.arrival_prob_decay) * dist / window))
+
+    def _effective_objectives(self, edges, current_time):
+        """Per-edge objective used for the final pick.
+
+        Identical to ``edge.mean_objective`` unless arrival-prob weighting is on,
+        in which case each reserve edge's objective is blended toward the best
+        non-reserve branch by its future lot's arrival probability (方向2).
+        """
+        effective = {id(edge): edge.mean_objective for edge in edges}
+        if not self.config.arrival_prob_weighting:
+            return effective
+        non_reserve = [
+            edge
+            for edge in edges
+            if edge.action.kind != "reserve" and edge.mean_objective is not None
+        ]
+        if not non_reserve:
+            return effective
+        miss_obj = max(
+            non_reserve,
+            key=lambda edge: objective_to_score(edge.mean_objective, self.config),
+        ).mean_objective
+        for edge in edges:
+            if edge.action.kind == "reserve" and edge.mean_objective is not None:
+                p = self._arrival_prob(edge.action.eta, current_time)
+                effective[id(edge)] = blend_objectives(p, edge.mean_objective, miss_obj)
+        return effective
+
+    def _choose_final_action(self, edges, current_time=0.0):
+        effective = self._effective_objectives(edges, current_time)
+
         def key(edge):
-            objective = edge.mean_objective
+            objective = effective[id(edge)]
             if objective is None:
                 return (0.0, 0.0, 0.0, 0.0, -1)
             return (
@@ -240,14 +325,14 @@ class VCMCTSPlanner:
         alternatives = [
             edge
             for edge in ranked
-            if edge.action.kind != "no_op" and edge.mean_objective is not None
+            if edge.action.kind != "no_op" and effective[id(edge)] is not None
         ]
-        noop_objective = selected.mean_objective
+        noop_objective = effective[id(selected)]
         if not alternatives or noop_objective is None:
             return selected
 
         best_alternative = alternatives[0]
-        alternative_objective = best_alternative.mean_objective
+        alternative_objective = effective[id(best_alternative)]
         noop_has_qtime_advantage = (
             float(noop_objective.qtime_violation_count)
             < float(alternative_objective.qtime_violation_count)
@@ -324,7 +409,40 @@ class VCMCTSPlanner:
                     prior=max(1e-6, float(opportunity.score)),
                 )
             )
+        if self.config.prior_source == "policy" and self.prior_provider is not None:
+            actions = self._assign_policy_priors(actions, driver, machine, pool)
         return actions
+
+    def _assign_policy_priors(self, actions, driver, machine, pool):
+        """Overwrite root priors with SAS policy probabilities plus reserve mass."""
+        probs = self.prior_provider.candidate_probs(driver, machine, pool=pool)
+        prob_count = len(probs)
+
+        wait_prob = 0.0
+        for index, action in enumerate(pool.actions):
+            if not bool(pool.action_mask[index]):
+                continue
+            if getattr(action, "is_wait", False) and index < prob_count:
+                wait_prob += float(probs[index])
+
+        raw_priors = []
+        for action in actions:
+            if action.kind in ("dispatch", "delegate_dispatch"):
+                index = int(action.action_index)
+                prior = float(probs[index]) if 0 <= index < prob_count else 0.0
+            elif action.kind == "no_op":
+                prior = wait_prob
+            elif action.kind == "reserve":
+                prior = float(self.config.policy_reserve_prior)
+            else:
+                prior = 0.0
+            raw_priors.append(max(1e-6, prior))
+
+        total = float(sum(raw_priors))
+        return [
+            replace(action, prior=float(prior) / total)
+            for action, prior in zip(actions, raw_priors)
+        ]
 
     def evaluate_action(self, driver, ledger, action):
         if self.rollout_evaluator is not None:
@@ -333,6 +451,11 @@ class VCMCTSPlanner:
         branch_driver = clone_driver_for_rollout(driver)
         branch_ledger = clone_ledger_for_rollout(ledger)
         self._apply_action(branch_driver, branch_ledger, action)
+        if self.config.use_leaf_value and self.leaf_value is not None:
+            objective = self._leaf_value_objective(branch_driver, branch_ledger)
+            if objective is not None:
+                return objective
+
         run_rule_episode_with_reservations(
             branch_driver,
             ledger=branch_ledger,
@@ -347,6 +470,62 @@ class VCMCTSPlanner:
             priority_weighted_wait=float(metrics["priority_weighted_wait"]),
             avg_utilization=float(metrics["avg_utilization"]),
         )
+
+    def _leaf_value_objective(self, branch_driver, branch_ledger):
+        """Partial rollout to a leaf, then bootstrap covered objective dimensions."""
+        run_rule_episode_with_reservations(
+            branch_driver,
+            ledger=branch_ledger,
+            strategy=self.config.rollout_strategy,
+            max_steps=int(self.config.leaf_rollout_depth),
+            dispatch_delegate=self.dispatch_delegate,
+        )
+
+        done, _reason = branch_driver.is_episode_done()
+        if done:
+            return None
+
+        machine = self._leaf_machine(branch_driver, branch_ledger)
+        if machine is None:
+            return None
+
+        partial_metrics = schedule_metrics_with_priority_wait(
+            branch_driver.env.encoder,
+            branch_driver.env,
+        )
+        critic_values = self.leaf_value.estimate(branch_driver, machine)
+        from vc_mcts_alphazero import critic_to_objective_dims
+
+        dims = critic_to_objective_dims(
+            critic_values,
+            partial_metrics,
+            num_lots=branch_driver.env.encoder.num_lots,
+        )
+        return VCMCTSObjective(
+            qtime_violation_count=float(dims["qtime_violation_count"]),
+            qtime_violation_total=float(dims["qtime_violation_total"]),
+            priority_weighted_wait=float(dims["priority_weighted_wait"]),
+            avg_utilization=float(dims["avg_utilization"]),
+            is_leaf_bootstrap=True,
+        )
+
+    def _leaf_machine(self, driver, ledger):
+        machines = [
+            machine
+            for machine in driver.get_dispatchable_machines()
+            if machine not in ledger.reserved_machines()
+        ]
+        if not machines:
+            if advance_to_next_event_with_ledger(driver, ledger) is None:
+                return None
+            machines = [
+                machine
+                for machine in driver.get_dispatchable_machines()
+                if machine not in ledger.reserved_machines()
+            ]
+        if not machines:
+            return None
+        return driver.select_next_machine(machines)
 
     def _apply_action(self, driver, ledger, action):
         if action.kind == "no_op":
@@ -444,6 +623,7 @@ def run_vc_mcts_reservation_episode(
     reserve_available_seen = 0
     reserve_selected_seen = 0
     reservations_made = 0
+    reservations_consumed = 0
     episode_reward = 0.0
     limit = int(driver.max_steps if max_steps is None else max_steps)
 
@@ -457,6 +637,7 @@ def run_vc_mcts_reservation_episode(
         reserved_result = _dispatch_reserved_target_if_ready(driver, ledger)
         if reserved_result is not None:
             episode_reward += float(reserved_result.reward)
+            reservations_consumed += 1
             steps += 1
             continue
 
@@ -553,6 +734,7 @@ def run_vc_mcts_reservation_episode(
     summary = driver._summary(steps, episode_reward)
     summary["vc_mcts_decisions"] = int(decisions)
     summary["reservations_made"] = int(reservations_made)
+    summary["reservations_consumed"] = int(reservations_consumed)
     summary["reserve_available_decisions"] = int(reserve_available_seen)
     summary["reserve_selected_decisions"] = int(reserve_selected_seen)
     summary["active_reservations"] = len(ledger.reserved_machines())

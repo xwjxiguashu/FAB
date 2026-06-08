@@ -31,6 +31,7 @@ from vc_mcts_planner import (
     VCMCTSPlanner,
     run_vc_mcts_reservation_episode,
 )
+from vc_mcts_alphazero import load_sas_alphazero
 from vc_mcts_trace_summary import summarize_trace_file
 
 
@@ -91,6 +92,10 @@ def run_seed(
     dispatch_delegate="topk",
     sas_checkpoint=None,
     sas_stochastic=False,
+    prior_source="heuristic",
+    use_leaf_value=False,
+    leaf_rollout_depth=8,
+    alphazero_checkpoint=None,
 ):
     factory = _encoder_factory(instance)
 
@@ -145,6 +150,20 @@ def run_seed(
         sas_checkpoint=sas_checkpoint,
         sas_stochastic=sas_stochastic,
     )
+    prior_provider = None
+    leaf_value = None
+    needs_alphazero_checkpoint = prior_source == "policy" or use_leaf_value
+    if needs_alphazero_checkpoint and not alphazero_checkpoint:
+        raise ValueError(
+            "alphazero checkpoint is required when --prior-source policy "
+            "or --use-leaf-value is enabled"
+        )
+    if needs_alphazero_checkpoint:
+        prior_provider, leaf_value, _policy = load_sas_alphazero(
+            alphazero_checkpoint,
+            require_multihead=use_leaf_value,
+        )
+
     planner = VCMCTSPlanner(
         VCMCTSConfig(
             n_iter=n_iter,
@@ -153,8 +172,13 @@ def run_seed(
             rollout_strategy=strategy,
             rollout_max_steps=rollout_max_steps or max_steps,
             use_delegate_dispatch=use_delegate_dispatch,
+            prior_source=prior_source,
+            use_leaf_value=use_leaf_value,
+            leaf_rollout_depth=leaf_rollout_depth,
         ),
         dispatch_delegate=delegate,
+        prior_provider=prior_provider,
+        leaf_value=leaf_value,
     )
     trace_file = None
     try:
@@ -239,6 +263,10 @@ def _run_seed_job(args):
         dispatch_delegate,
         sas_checkpoint,
         sas_stochastic,
+        prior_source,
+        use_leaf_value,
+        leaf_rollout_depth,
+        alphazero_checkpoint,
     ) = args
     t0 = time.time()
     row = run_seed(
@@ -262,6 +290,10 @@ def _run_seed_job(args):
         dispatch_delegate=dispatch_delegate,
         sas_checkpoint=sas_checkpoint,
         sas_stochastic=sas_stochastic,
+        prior_source=prior_source,
+        use_leaf_value=use_leaf_value,
+        leaf_rollout_depth=leaf_rollout_depth,
+        alphazero_checkpoint=alphazero_checkpoint,
     )
     row["_elapsed_s"] = time.time() - t0
     return row
@@ -304,6 +336,10 @@ def main(
     dispatch_delegate="topk",
     sas_checkpoint=None,
     sas_stochastic=False,
+    prior_source="heuristic",
+    use_leaf_value=False,
+    leaf_rollout_depth=8,
+    alphazero_checkpoint=None,
 ):
     n = int(seeds)
     workers = max(1, int(workers))
@@ -342,6 +378,10 @@ def main(
                 dispatch_delegate,
                 sas_checkpoint,
                 sas_stochastic,
+                prior_source,
+                use_leaf_value,
+                leaf_rollout_depth,
+                alphazero_checkpoint,
             )
         )
 
@@ -404,6 +444,14 @@ def _cli():
     )
     parser.add_argument("--sas-checkpoint", default=None)
     parser.add_argument("--sas-stochastic", action="store_true")
+    parser.add_argument(
+        "--prior-source",
+        choices=["heuristic", "policy"],
+        default="heuristic",
+    )
+    parser.add_argument("--use-leaf-value", action="store_true")
+    parser.add_argument("--leaf-rollout-depth", type=int, default=8)
+    parser.add_argument("--alphazero-checkpoint", default=None)
     parser.add_argument("--noise", action="store_true")
     args = parser.parse_args()
     main(
@@ -428,6 +476,10 @@ def _cli():
         dispatch_delegate=args.dispatch_delegate,
         sas_checkpoint=args.sas_checkpoint,
         sas_stochastic=args.sas_stochastic,
+        prior_source=args.prior_source,
+        use_leaf_value=args.use_leaf_value,
+        leaf_rollout_depth=args.leaf_rollout_depth,
+        alphazero_checkpoint=args.alphazero_checkpoint,
     )
 
 

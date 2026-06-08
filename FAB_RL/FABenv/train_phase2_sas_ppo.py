@@ -15,7 +15,11 @@ from phase2_sas_driver import Phase2EpisodeDriver
 from phase2_sas_observation import Phase2ObservationEncoder
 from phase2_sas_policy import Phase2SASActorCritic, Phase2SASMultiHeadActorCritic
 from problem_generator import build_random_encoder, sample_random_problem_config
-from problem_instances import build_pressure_test_encoder, build_small_encoder
+from problem_instances import (
+    build_late_hi_encoder,
+    build_pressure_test_encoder,
+    build_small_encoder,
+)
 from rl_environment import ResourceCalendarEnv, RewardConfig, RewardVectorConfig
 from training_logger import TensorBoardTrainingLogger
 
@@ -314,9 +318,10 @@ def main(num_episodes=3, mode="small", tensorboard_logdir=None, save_path=None,
          device=None, instance="small", save_every=0, parallel=0,
          priority_filter_mode="soft", priority_min_gap=0.0):
     if mode == "multihead":
-        mh_encoder_factory = (
-            build_pressure_test_encoder if instance == "pressure" else None
-        )
+        mh_encoder_factory = {
+            "pressure": build_pressure_test_encoder,
+            "late_hi": build_late_hi_encoder,
+        }.get(instance)
         components = build_multihead_training_components(
             encoder_factory=mh_encoder_factory,
             use_qtime_lagrangian=use_qtime_lagrangian,
@@ -419,8 +424,9 @@ def _parse_args():
         help="训练设备：auto=有显卡用 CUDA 否则 CPU；cuda=强制 GPU；cpu=强制 CPU",
     )
     parser.add_argument(
-        "--instance", choices=["small", "pressure"], default="small",
-        help="(multihead only) 训练实例：small(4 lots) 或 pressure(50 lots)",
+        "--instance", choices=["small", "pressure", "late_hi"], default="small",
+        help="(multihead only) 训练实例：small(4 lots)、pressure(50 lots 随机优先级) "
+             "或 late_hi(50 lots, 高优先级晚到, 与到达高度正相关)",
     )
     parser.add_argument(
         "--save-every", type=int, default=0,
@@ -461,9 +467,12 @@ def _run_cli():
     )
 
 
-if __name__ == "__main__":
-    # 改下面参数即可；要用命令行就注释这段 main(...)、解开末尾的 _run_cli()。
-    # save_path 锚定到本文件目录：VSCode 的 cwd 常是工作区根，相对路径会存错地方。
+def _run_default():
+    """无命令行参数时的默认运行 (双击 / 直接 python train_phase2_sas_ppo.py)。
+
+    改这里的参数即可调整无参运行行为。带参数运行时走 _run_cli() (见下方 __main__)。
+    save_path 锚定到本文件目录：VSCode 的 cwd 常是工作区根，相对路径会存错地方。
+    """
     import os as _os
     _HERE = _os.path.dirname(_os.path.abspath(__file__))
 
@@ -481,4 +490,15 @@ if __name__ == "__main__":
         save_path=_os.path.join(_HERE, "pressure_mh_hard.pt"),
         device="auto",                    # 瓶颈在 CPU 仿真，GPU 无加速
     )
-    # _run_cli()  # 命令行用法
+
+
+if __name__ == "__main__":
+    # CLI 优先：有命令行参数 → 走 _parse_args()/_run_cli() (CLAUDE.md 文档的用法)；
+    # 无参数 → 回退到 _run_default() 的硬编码默认 (双击直跑 pressure 训练的便利)。
+    # (历史教训：此前 __main__ 无条件硬编码 pressure 且注释掉 _run_cli()，导致
+    #  `--instance late_hi` 等 CLI 参数被静默忽略、误覆盖 pressure_mh_hard.pt。)
+    import sys as _sys
+    if len(_sys.argv) > 1:
+        _run_cli()
+    else:
+        _run_default()
