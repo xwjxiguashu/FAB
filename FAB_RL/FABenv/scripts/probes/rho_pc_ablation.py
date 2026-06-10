@@ -30,13 +30,12 @@ OUT_DIR = FABENV_ROOT / "artifacts" / "results" / "rho_pc_ablation"
 CONFIGS = [
     ("off", None),
     ("alpha_1.0", 1.0),
-    ("alpha_0.8", 0.8),
     ("alpha_0.6", 0.6),
     ("alpha_0.4", 0.4),
 ]
 
 
-def main(seeds=3, n_iter=8, top_b=2, rollout_max_steps=60, workers=3):
+def main(seeds=3, n_iter=4, top_b=2, rollout_max_steps=60, workers=3):
     OUT_DIR.mkdir(parents=True, exist_ok=True)
     rows = []
     for label, alpha in CONFIGS:
@@ -55,6 +54,8 @@ def main(seeds=3, n_iter=8, top_b=2, rollout_max_steps=60, workers=3):
             "--n-iter", str(n_iter),
             "--top-b", str(top_b),
             "--rollout-max-steps", str(rollout_max_steps),
+            "--max-decisions", "150",
+            "--qtime-mask-mode", "aggregate",
             "--workers", str(workers),
             "--dispatch-delegate", "rule",
             "--trace-out", str(trace_path),
