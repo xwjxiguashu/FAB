@@ -42,6 +42,21 @@ class VCMCTSConfig:
     arrival_prob_weighting: bool = False
     arrival_prob_decay: float = 1.0
     lookahead_window: float = 4.0
+    # 机制 3 (报告 §7.9): CRN 多路噪声 rollout。crn_noise=True 时每次 evaluate_action
+    # 跑 n_mc 条带噪 rollout 并取均值 Ê[obj]，各候选边复用同一组 crn_seed_base+k 种子
+    # (公共随机数 → 比较时共同噪声相减抵消)。crn_noise=False (默认) → 行为不变。
+    crn_noise: bool = False
+    n_mc: int = 1
+    crn_seed_base: int = 0
+    # 机制 2 (报告8 §7.12): 优先级-能力对冲水位 ρ_pc (二部匹配裕量)。use_rho_pc=True
+    # 时每条 root 边算 ρ̃_pc(s⊕a) 的 before/after/delta，并把 UCT exploitation 换成
+    # α·q̂ + (1−α)·ρ̂_pc 插值 (rho_pc_alpha=1.0 即纯 q̂，等价旧行为作消融基线)；
+    # rho_pc_weight 保留为 Δρ_pc 的加性兼容旋钮。只影响搜索引导，最终
+    # objective-first 字典序选择不变 (硬约束 Q-time→O2→util 保证不受影响)。
+    use_rho_pc: bool = False
+    rho_pc_weight: float = 0.0
+    rho_pc_alpha: float = 1.0
+    rho_pc_priority_threshold: float | None = None
 
 
 @dataclass(frozen=True)
@@ -86,6 +101,10 @@ class VCMCTSEdgeStats:
     total_o2: float = 0.0
     total_util: float = 0.0
     leaf_bootstrap_visits: int = 0
+    # 机制 2: 二部匹配对冲水位 (状态导出, plan() 时算一次, 不随 rollout 变)
+    rho_pc_before: float = 0.0
+    rho_pc_after: float = 0.0
+    delta_rho_pc: float = 0.0
 
     def record(self, objective):
         self.visits += 1
@@ -120,6 +139,10 @@ class VCMCTSEdgeStats:
             "mean_util": None if mean is None else float(mean.avg_utilization),
             "leaf_bootstrap_visits": int(self.leaf_bootstrap_visits),
             "mean_is_leaf_bootstrap": None if mean is None else bool(mean.is_leaf_bootstrap),
+            "rho_pc": float(self.rho_pc_after),
+            "rho_pc_before": float(self.rho_pc_before),
+            "rho_pc_after": float(self.rho_pc_after),
+            "delta_rho_pc": float(self.delta_rho_pc),
         }
 
 
@@ -216,6 +239,21 @@ def blend_objectives(p, arrive_obj, miss_obj):
     )
 
 
+def mean_objective(objectives):
+    """Arithmetic mean of a list of objectives (机制 3: Ê[obj] over N_mc rollouts)."""
+    objectives = [obj for obj in objectives if obj is not None]
+    if not objectives:
+        return None
+    n = float(len(objectives))
+    return VCMCTSObjective(
+        qtime_violation_count=sum(o.qtime_violation_count for o in objectives) / n,
+        qtime_violation_total=sum(o.qtime_violation_total for o in objectives) / n,
+        priority_weighted_wait=sum(o.priority_weighted_wait for o in objectives) / n,
+        avg_utilization=sum(o.avg_utilization for o in objectives) / n,
+        is_leaf_bootstrap=any(o.is_leaf_bootstrap for o in objectives),
+    )
+
+
 class VCMCTSPlanner:
     def __init__(
         self,
@@ -235,6 +273,19 @@ class VCMCTSPlanner:
         current_time = float(driver.env.current_time)
         actions = self.build_root_actions(driver, ledger, machine)
         edges = [VCMCTSEdgeStats(action=action) for action in actions]
+        if self.config.use_rho_pc:
+            from priority_capability_matching import rho_pc_for_action
+
+            for edge in edges:
+                rho = rho_pc_for_action(
+                    driver.env,
+                    ledger,
+                    edge.action,
+                    priority_threshold=self.config.rho_pc_priority_threshold,
+                )
+                edge.rho_pc_before = rho.before
+                edge.rho_pc_after = rho.after
+                edge.delta_rho_pc = rho.delta
         iteration_count = max(len(edges), int(self.config.n_iter))
         for _ in range(iteration_count):
             edge = self._select_edge(edges)
@@ -258,6 +309,9 @@ class VCMCTSPlanner:
         def uct(edge):
             mean = edge.mean_objective
             exploitation = objective_to_score(mean, self.config)
+            if self.config.use_rho_pc:
+                # 机制 2: 优先级-能力对冲水位偏置 (只引导搜索, 不改最终字典序选择)
+                exploitation += float(self.config.rho_pc_weight) * float(edge.delta_rho_pc)
             exploration = (
                 float(self.config.exploration_c)
                 * float(edge.action.prior)
@@ -448,8 +502,25 @@ class VCMCTSPlanner:
         if self.rollout_evaluator is not None:
             return self.rollout_evaluator(driver, ledger, action, self.config)
 
+        if not self.config.crn_noise or int(self.config.n_mc) <= 1:
+            return self._evaluate_action_once(driver, ledger, action, noise_seed=None)
+
+        # 机制 3 (报告 §7.9): N_mc 条带噪 rollout 取均值 Ê[obj]。同一节点下所有候选边
+        # 复用同一组种子 crn_seed_base + k，公共随机数在比较时相减抵消 → 比的是动作差异
+        # 而非噪声。小 n_mc (3–8) 即可给出稳定排序。
+        samples = []
+        for k in range(int(self.config.n_mc)):
+            seed = int(self.config.crn_seed_base) + k
+            samples.append(
+                self._evaluate_action_once(driver, ledger, action, noise_seed=seed)
+            )
+        return mean_objective(samples)
+
+    def _evaluate_action_once(self, driver, ledger, action, noise_seed=None):
         branch_driver = clone_driver_for_rollout(driver)
         branch_ledger = clone_ledger_for_rollout(ledger)
+        if noise_seed is not None:
+            branch_driver.env.enable_process_noise(noise_seed)
         self._apply_action(branch_driver, branch_ledger, action)
         if self.config.use_leaf_value and self.leaf_value is not None:
             objective = self._leaf_value_objective(branch_driver, branch_ledger)
