@@ -1,6 +1,8 @@
 import json
 from pathlib import Path
 
+import pytest
+
 from dispatch_delegate import RuleDispatchDelegate
 from phase2_sas_driver import Phase2EpisodeDriver
 from phase2_sas_observation import Phase2ObservationEncoder
@@ -383,7 +385,7 @@ from vc_mcts_probe import (
 )
 
 
-def test_vc_mcts_probe_run_seed_returns_baseline_oracle_and_mcts():
+def test_vc_mcts_probe_run_seed_uses_sas_delegate_by_default():
     row = run_vc_mcts_seed(
         instance="small",
         seed=0,
@@ -393,11 +395,14 @@ def test_vc_mcts_probe_run_seed_returns_baseline_oracle_and_mcts():
         top_k_dispatch=2,
         n_iter=2,
         max_steps=200,
+        skip_oracle=True,
     )
 
     assert set(row) >= {"seed", "baseline", "oracle", "vc_mcts", "delta"}
+    assert row["oracle"] is None
     assert row["baseline"]["completed_lots"] == 4.0
     assert row["vc_mcts"]["completed_lots"] == 4.0
+    assert row["vc_mcts"]["dispatch_delegate"].startswith("sas:")
 
 
 def test_vc_mcts_episode_writes_trace_and_stops_at_max_decisions(small_encoder):
@@ -459,24 +464,22 @@ def test_vc_mcts_probe_can_skip_oracle_and_write_trace(tmp_path):
     assert summary["reserve_available_decisions"] == 1
 
 
-def test_vc_mcts_probe_supports_rule_dispatch_delegate():
-    row = run_vc_mcts_seed(
-        instance="small",
-        seed=0,
-        strategy="FIFO",
-        w_lookahead=4.0,
-        top_b=1,
-        top_k_dispatch=2,
-        n_iter=2,
-        max_steps=200,
-        skip_oracle=True,
-        rollout_max_steps=20,
-        dispatch_delegate="rule",
-    )
-
-    assert row["oracle"] is None
-    assert row["vc_mcts"]["completed_lots"] == 4.0
-    assert row["vc_mcts"]["dispatch_delegate"] == "rule:FIFO"
+def test_vc_mcts_probe_rejects_unknown_delegate_modes():
+    # "sas" 与 "rule" (机制 2 消融用, 无需 checkpoint) 合法; 其他一律拒绝
+    with pytest.raises(ValueError):
+        run_vc_mcts_seed(
+            instance="small",
+            seed=0,
+            strategy="FIFO",
+            w_lookahead=4.0,
+            top_b=1,
+            top_k_dispatch=2,
+            n_iter=2,
+            max_steps=200,
+            skip_oracle=True,
+            rollout_max_steps=20,
+            dispatch_delegate="topk",
+        )
 
 
 def test_vc_mcts_probe_seed_output_path_inserts_seed_before_suffix():

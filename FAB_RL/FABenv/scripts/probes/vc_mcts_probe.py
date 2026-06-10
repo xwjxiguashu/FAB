@@ -116,6 +116,7 @@ def run_seed(
     rho_pc_weight=0.0,
     rho_pc_alpha=1.0,
     rho_pc_priority_threshold=None,
+    qtime_mask_mode=None,
 ):
     factory = _encoder_factory(instance)
 
@@ -127,6 +128,8 @@ def run_seed(
         process_noise_enabled=process_noise,
         noise_seed=seed,
     )
+    if qtime_mask_mode:
+        baseline_env.qtime_mask_mode = str(qtime_mask_mode)
     baseline_driver = _driver(baseline_env, max_steps)
     baseline_driver.reset_episode()
     baseline_summary = baseline_driver.run_rule_episode(strategy=strategy)
@@ -143,6 +146,8 @@ def run_seed(
             process_noise_enabled=process_noise,
             noise_seed=seed,
         )
+        if qtime_mask_mode:
+            oracle_env.qtime_mask_mode = str(qtime_mask_mode)
         oracle_driver = _driver(oracle_env, max_steps)
         oracle_driver.reset_episode()
         oracle_summary = run_oracle_reservation_episode(
@@ -162,6 +167,8 @@ def run_seed(
         process_noise_enabled=process_noise,
         noise_seed=seed,
     )
+    if qtime_mask_mode:
+        mcts_env.qtime_mask_mode = str(qtime_mask_mode)
     mcts_driver = _driver(mcts_env, max_steps)
     mcts_driver.reset_episode()
     delegate, use_delegate_dispatch = _make_dispatch_delegate(
@@ -300,6 +307,7 @@ def _run_seed_job(args):
         rho_pc_weight,
         rho_pc_alpha,
         rho_pc_priority_threshold,
+        qtime_mask_mode,
     ) = args
     t0 = time.time()
     row = run_seed(
@@ -333,6 +341,7 @@ def _run_seed_job(args):
         rho_pc_weight=rho_pc_weight,
         rho_pc_alpha=rho_pc_alpha,
         rho_pc_priority_threshold=rho_pc_priority_threshold,
+        qtime_mask_mode=qtime_mask_mode,
     )
     row["_elapsed_s"] = time.time() - t0
     return row
@@ -385,6 +394,7 @@ def main(
     rho_pc_weight=0.0,
     rho_pc_alpha=1.0,
     rho_pc_priority_threshold=None,
+    qtime_mask_mode=None,
 ):
     n = int(seeds)
     workers = max(1, int(workers))
@@ -433,6 +443,7 @@ def main(
                 rho_pc_weight,
                 rho_pc_alpha,
                 rho_pc_priority_threshold,
+                qtime_mask_mode,
             )
         )
 
@@ -528,6 +539,12 @@ def _cli():
         default=None,
         help="机制 2: 高优先级类阈值 p_hi (缺省取窗内可见优先级中位数)",
     )
+    parser.add_argument(
+        "--qtime-mask-mode",
+        choices=["aggregate", "chain", "chain_joint"],
+        default=None,
+        help="覆盖环境默认 qtime mask 口径 (chain_joint 较精确但慢 ~8x; 缺省不覆盖)",
+    )
     args = parser.parse_args()
     main(
         instance=args.instance,
@@ -561,6 +578,7 @@ def _cli():
         rho_pc_weight=args.rho_pc_weight,
         rho_pc_alpha=args.rho_pc_alpha,
         rho_pc_priority_threshold=args.rho_pc_priority_threshold,
+        qtime_mask_mode=args.qtime_mask_mode,
     )
 
 
