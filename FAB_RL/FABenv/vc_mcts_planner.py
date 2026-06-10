@@ -306,12 +306,36 @@ class VCMCTSPlanner:
         total_visits = sum(edge.visits for edge in edges)
         log_total = math.log(max(total_visits, 1))
 
+        # 机制 2 (报告8 §7.12.3): q̂ 在边集内 min-max 归一化到 [0,1]，使其与
+        # ρ̂_pc (天然 ∈ [0,1]) 可比，才能做 α 插值。
+        raw_scores = {
+            id(edge): objective_to_score(edge.mean_objective, self.config)
+            for edge in edges
+            if edge.mean_objective is not None
+        }
+        if raw_scores:
+            min_score = min(raw_scores.values())
+            max_score = max(raw_scores.values())
+            score_span = max(max_score - min_score, 1e-9)
+        else:
+            min_score = 0.0
+            score_span = 1.0
+
         def uct(edge):
             mean = edge.mean_objective
-            exploitation = objective_to_score(mean, self.config)
+            raw_score = objective_to_score(mean, self.config)
             if self.config.use_rho_pc:
-                # 机制 2: 优先级-能力对冲水位偏置 (只引导搜索, 不改最终字典序选择)
+                # E(s,a) = α·q̂ + (1−α)·ρ̂_pc (只引导搜索, 不改最终字典序选择);
+                # rho_pc_weight·Δρ_pc 保留为旧探针的加性兼容旋钮。
+                q_hat = (raw_score - min_score) / score_span
+                alpha = min(1.0, max(0.0, float(self.config.rho_pc_alpha)))
+                exploitation = (
+                    alpha * float(q_hat)
+                    + (1.0 - alpha) * float(edge.rho_pc_after)
+                )
                 exploitation += float(self.config.rho_pc_weight) * float(edge.delta_rho_pc)
+            else:
+                exploitation = raw_score
             exploration = (
                 float(self.config.exploration_c)
                 * float(edge.action.prior)

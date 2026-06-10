@@ -204,6 +204,43 @@ def test_planner_populates_matching_rho_pc_fields_when_enabled(small_encoder):
     assert any(item["delta_rho_pc"] >= 0.0 for item in edge_dicts if item["kind"] == "reserve")
 
 
+def _scored_edge(kind, o2, rho_pc_after, prior=1.0):
+    from vc_mcts_planner import VCMCTSAction, VCMCTSEdgeStats
+
+    edge = VCMCTSEdgeStats(action=VCMCTSAction(kind=kind, machine=1, prior=prior))
+    edge.record(
+        VCMCTSObjective(
+            qtime_violation_count=0.0,
+            qtime_violation_total=0.0,
+            priority_weighted_wait=o2,
+            avg_utilization=0.5,
+        )
+    )
+    edge.rho_pc_after = rho_pc_after
+    return edge
+
+
+def test_select_edge_alpha_interpolates_between_qhat_and_rho_pc():
+    """E(s,a) = α·q̂ + (1−α)·ρ̂_pc (报告8 §7.12.3): q̂ 与 ρ̂_pc 冲突时 α 决定选边。
+
+    边 A: q̂ 更优 (O2 低) 但对冲水位低; 边 B: q̂ 更差但水位满。两边 prior/visits
+    相同 → exploration 相等, 选边完全由 exploitation 插值决定。
+    """
+    edge_better_qhat = _scored_edge("dispatch", o2=1.0, rho_pc_after=0.0)
+    edge_better_rho = _scored_edge("reserve", o2=5.0, rho_pc_after=1.0)
+    edges = [edge_better_qhat, edge_better_rho]
+
+    qhat_only = VCMCTSPlanner(VCMCTSConfig(use_rho_pc=True, rho_pc_alpha=1.0))
+    assert qhat_only._select_edge(edges) is edge_better_qhat
+
+    rho_only = VCMCTSPlanner(VCMCTSConfig(use_rho_pc=True, rho_pc_alpha=0.0))
+    assert rho_only._select_edge(edges) is edge_better_rho
+
+    # use_rho_pc=False → 旧行为不变 (纯 q̂)
+    legacy = VCMCTSPlanner(VCMCTSConfig(use_rho_pc=False, rho_pc_alpha=0.0))
+    assert legacy._select_edge(edges) is edge_better_qhat
+
+
 def test_rho_pc_biases_selection_toward_reserve_with_injected_evaluator(small_encoder):
     """ρ_pc 偏置应能在 reserve 与 dispatch 目标接近时把搜索引向 reserve。"""
     env = ResourceCalendarEnv(small_encoder, top_k=8, w_lookahead=4.0)
