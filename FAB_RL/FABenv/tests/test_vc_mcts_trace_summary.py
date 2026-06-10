@@ -134,3 +134,34 @@ def test_read_jsonl_trace_skips_blank_lines(tmp_path):
     records = read_jsonl_trace(trace_path)
 
     assert [record["selected_action"]["kind"] for record in records] == ["no_op", "reserve"]
+
+
+def test_trace_summary_reports_delta_rho_pc_buckets(tmp_path):
+    from vc_mcts_trace_summary import summarize_trace_file
+
+    path = tmp_path / "trace.jsonl"
+    rows = [
+        {
+            "selected_action": {"kind": "reserve", "future_lot": 3},
+            "edges": [
+                {"kind": "reserve", "delta_rho_pc": 0.50, "mean_o2": 8.0},
+                {"kind": "delegate_dispatch", "delta_rho_pc": -0.25, "mean_o2": 10.0},
+            ],
+            "diagnostics": {"reserve_was_available": True, "reserve_was_selected": True},
+        },
+        {
+            "selected_action": {"kind": "delegate_dispatch"},
+            "edges": [
+                {"kind": "reserve", "delta_rho_pc": 0.10, "mean_o2": 11.0},
+                {"kind": "delegate_dispatch", "delta_rho_pc": 0.0, "mean_o2": 9.0},
+            ],
+            "diagnostics": {"reserve_was_available": True, "reserve_was_selected": False},
+        },
+    ]
+    path.write_text("\n".join(json.dumps(row) for row in rows), encoding="utf-8")
+
+    summary = summarize_trace_file(path)
+
+    assert summary["rho_pc_edge_count"] == 4
+    assert summary["rho_pc_positive_delta_edges"] == 2
+    assert summary["rho_pc_selected_reserve_delta_avg"] == 0.5
