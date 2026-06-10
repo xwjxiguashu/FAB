@@ -161,3 +161,83 @@ def rho_pc_state(env, ledger, priority_threshold=None, blocked_machines=()):
         blocked_machines=blocked_machines,
     )
     return solve_weighted_capability_matching(graph)
+
+
+@dataclass(frozen=True)
+class RhoPcActionResult:
+    before: float
+    after: float
+    delta: float
+    before_pairs: frozenset[tuple[int, int]]
+    after_pairs: frozenset[tuple[int, int]]
+    forced_pairs: frozenset[tuple[int, int]]
+
+
+def _solve_with_forced_pair(env, ledger, action, priority_threshold):
+    """reserve(m,h): 匹配被钉死包含 (m,h)，其余节点上再求最大匹配 (s ⊕ a 语义)。"""
+    if action.kind != "reserve" or action.machine is None or action.future_lot is None:
+        return rho_pc_state(env, ledger, priority_threshold=priority_threshold), frozenset()
+
+    forced = (int(action.machine), int(action.future_lot))
+    graph = build_priority_capability_graph(env, ledger, priority_threshold=priority_threshold)
+    edge_set = {(edge.machine, edge.future_lot) for edge in graph.edges}
+    if forced not in edge_set:
+        return solve_weighted_capability_matching(graph), frozenset()
+
+    remaining_machines = tuple(m for m in graph.machines if m != forced[0])
+    remaining_lots = tuple(h for h in graph.future_lots if h != forced[1])
+    remaining_edges = tuple(
+        edge
+        for edge in graph.edges
+        if edge.machine != forced[0] and edge.future_lot != forced[1]
+    )
+    remaining_graph = CapabilityGraph(
+        machines=remaining_machines,
+        future_lots=remaining_lots,
+        lot_weights=graph.lot_weights,
+        edges=remaining_edges,
+    )
+    rest = solve_weighted_capability_matching(remaining_graph)
+    forced_weight = float(graph.lot_weights.get(forced[1], 0.0))
+    total_possible = float(sum(graph.lot_weights.get(h, 0.0) for h in graph.future_lots))
+    total = forced_weight + rest.total_weight
+    normalized = 0.0 if total_possible <= 0.0 else total / total_possible
+    pairs = frozenset(set(rest.pairs) | {forced})
+    covered = {lot for _machine, lot in pairs}
+    return CapabilityMatchResult(
+        total_weight=float(total),
+        normalized_waterline=float(normalized),
+        pairs=pairs,
+        uncovered_lots=frozenset(h for h in graph.future_lots if h not in covered),
+    ), frozenset({forced})
+
+
+def rho_pc_for_action(env, ledger, action, priority_threshold=None) -> RhoPcActionResult:
+    """边级对冲水位: ρ̂_pc(s,a) = ρ̃_pc(s ⊕ a), Δρ_pc = ρ̃_pc(s ⊕ a) − ρ̃_pc(s)。
+
+    dispatch(m): m 在占用区间内移出 M_t (blocked) → Δ ≤ 0;
+    reserve(m,h): 匹配钉死含 (m,h) → Δ ≥ 0; no_op: 不变。
+    """
+    before = rho_pc_state(env, ledger, priority_threshold=priority_threshold)
+    if action.kind in ("dispatch", "delegate_dispatch") and action.machine is not None:
+        after = rho_pc_state(
+            env,
+            ledger,
+            priority_threshold=priority_threshold,
+            blocked_machines=(int(action.machine),),
+        )
+        forced = frozenset()
+    elif action.kind == "reserve":
+        after, forced = _solve_with_forced_pair(env, ledger, action, priority_threshold)
+    else:
+        after = before
+        forced = frozenset()
+
+    return RhoPcActionResult(
+        before=float(before.normalized_waterline),
+        after=float(after.normalized_waterline),
+        delta=float(after.normalized_waterline - before.normalized_waterline),
+        before_pairs=before.pairs,
+        after_pairs=after.pairs,
+        forced_pairs=forced,
+    )
