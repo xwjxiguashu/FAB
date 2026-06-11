@@ -1,0 +1,5 @@
+[vc_mcts_probe] running 4 seeds on 4 workers (spawn)...
+[vc_mcts_probe] seed 1 done in 385s: O2_delta=-481.9 qtime_delta=-8 reservations=22 completed=50.0
+[vc_mcts_probe] seed 3 done in 396s: O2_delta=-193.5 qtime_delta=-12 reservations=19 completed=50.0
+[vc_mcts_probe] seed 0 done in 429s: O2_delta=-188.9 qtime_delta=-18 reservations=20 completed=50.0
+[vc_mcts_probe] seed 2 done in 437s: O2_delta=-515.7 qtime_delta=-14 reservations=24 completed=50.0

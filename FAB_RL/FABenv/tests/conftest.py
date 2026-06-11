@@ -6,8 +6,17 @@ import pytest
 
 
 FABENV_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-if FABENV_DIR not in sys.path:
-    sys.path.insert(0, FABENV_DIR)
+SCRIPT_DIR = os.path.join(FABENV_DIR, "scripts")
+IMPORT_DIRS = (
+    FABENV_DIR,
+    os.path.join(SCRIPT_DIR, "run"),
+    os.path.join(SCRIPT_DIR, "evaluation"),
+    os.path.join(SCRIPT_DIR, "experiments"),
+    os.path.join(SCRIPT_DIR, "probes"),
+)
+for import_dir in IMPORT_DIRS:
+    if import_dir not in sys.path:
+        sys.path.insert(0, import_dir)
 
 
 @pytest.fixture
