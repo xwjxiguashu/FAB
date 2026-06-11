@@ -72,3 +72,30 @@ Findings (the leverage-instance test 报告8 §7.12.2 性质 2 was waiting for):
    reproducibility bug (str-hash-order-dependent iteration somewhere in the
    scheduling path — separate debugging task; fix the env var for all
    multi-worker comparisons until located).
+
+## CORRECTION (2026-06-11, after the estimate-rng reproducibility fix)
+
+The late_hi_scarce table above is **retracted**. Those numbers were produced
+before the estimate() unseeded-rng bug was fixed: the OFF/ON "difference"
+(Q-time 28/18 vs 12) was per-process sampling drift of the estimator stream,
+not an effect of mechanism 2. Post-fix deterministic rerun (baseline now
+O2 3244.3 / Q-time 14, bit-identical across seeds and processes):
+
+| config | VC O2 | VC Q-time | util | resv |
+|---|---:|---:|---:|---:|
+| VC, mechanism 2 OFF | 2910.7 (-10.3%) | 28 | 0.745 | 13 |
+| VC, mechanism 2 ON (alpha=0.6) | 2910.7 (-10.3%) | 28 | 0.745 | 13 |
+
+ON and OFF now produce **identical schedules**. With the root-level planner and
+deterministic per-edge evaluation, edge means are fixed after warm-up, so the
+alpha-interpolated UCT guidance can only act through the final-pick visit
+tie-break — and no tie was flipped in 150 decisions on this instance. The
+honest status of mechanism 2 as currently implemented:
+- it is **harmless** (never degrades the lexicographic objective), and
+- its delta_rho_pc trace fields are a real, replayable leverage diagnostic
+  (nonzero only under capability scarcity, per §7.12.2 property 2/3),
+- but it has **no decision channel** under deterministic evaluation. To give it
+  one: (a) enable mechanism-3 noisy CRN evaluation so visit allocation affects
+  estimate quality, or (b) add a controlled rho_pc tie-break layer to the
+  lexicographic final pick (design change), or (c) keep it as diagnostics +
+  groundwork for a deeper tree. Decision pending.
