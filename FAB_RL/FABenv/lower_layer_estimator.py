@@ -196,13 +196,15 @@ def monte_carlo_makespan(
         stage_sigma:     list[float] — 各阶段加工时间标准差 (n_stages,)。
         instance_counts: list[int] — 各阶段实例数 (n_stages,)。
         n_mc:            蒙特卡洛采样次数 (默认 50)。
-        rng:             numpy Generator (None 则用 default_rng)。
+        rng:             numpy Generator (None 则用固定种子 default_rng(0) —— 估计
+                         必须可复现; 无种子 default_rng() 取 OS 熵会让 (μ,σ) 逐进程
+                         漂移, 进而让 qtime mask 边界候选翻转, 调度跨进程不可复现)。
 
     Returns:
         (mu_finish, sigma_finish) — makespan 的期望和标准差。
     """
     if rng is None:
-        rng = np.random.default_rng()
+        rng = np.random.default_rng(0)
 
     n_batches = len(sub_batches)
     n_stages = len(stage_mu)
@@ -370,8 +372,12 @@ def estimate(lot, machine, ppid, encoder, state, n_mc=50, rng=None, start_offset
     instance_counts = [max(1, c) for c in instance_counts]  # 至少 1
 
     # ---- Step 5: 蒙特卡洛 → (μ_finish, σ_finish) ----
+    # rng 缺省时按缓存键 (lot, machine, ppid, n_mc) 确定性派生 (2026-06-11 修复):
+    # estimate 的 base 结果正是以该键缓存的, 采样流也必须只依赖该键 —— 否则
+    # (μ,σ) 逐进程随机 (旧实现 default_rng() 取 OS 熵), qtime mask 在
+    # deadline−μ≈z·σ 的边界候选上翻转, 同一确定性实例的调度跨进程漂移。
     if rng is None:
-        rng = np.random.default_rng()
+        rng = np.random.default_rng((int(lot), int(machine), int(ppid), int(n_mc)))
 
     mu_finish, sigma_finish = monte_carlo_makespan(
         sub_batches,
