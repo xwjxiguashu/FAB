@@ -545,12 +545,17 @@ class ResourceCalendarEnv:
         self.w_lookahead = float(w_lookahead)
         self.noise_seed = noise_seed
         self._noise_rng = np.random.default_rng(noise_seed)
+        # 机制 3 CRN (报告 §7.9): 非 None 时 commit 路径改用按 (crn_seed, lot, ppid) 键控
+        # 的独立 Generator, 而非共享的顺序消费 _noise_rng。键控使同一 lot 在不同 rollout
+        # 分支 (dispatch / reserve / no_op, commit 顺序不同) 拿到完全相同的加工噪声 →
+        # 满足公共随机数 (CRN): 分支间目标差异反映动作选择, 而非噪声运气。
+        self._crn_seed = None
         self.priority_filter_mode = str(priority_filter_mode)
         self.priority_min_gap = float(priority_min_gap)
         # Q-time mask 口径: "aggregate" (现状: 单一聚合 deadline 代理)、
         # "chain" (按实际 q_time_limits 阶段链单次 dry-run 自检)、或
         # "chain_joint" (K 次独立带噪 dry-run 估 P(链上任一窗违规), 联合机会约束)。
-        self.qtime_mask_mode = "aggregate"
+        self.qtime_mask_mode = "chain_joint"
         self.qtime_chain_mc = 8          # chain_joint 的蒙特卡洛采样数
         self.qtime_chain_threshold = 0.0  # mask 条件: 违规样本占比 > 此阈值 (0=任一即屏蔽)
 
@@ -654,6 +659,23 @@ class ResourceCalendarEnv:
         }
 
     # ---- 时间与重置 ----
+
+    def enable_process_noise(self, crn_seed):
+        """开启 commit 路径加工噪声, 并切到 CRN 键控模式 (机制 3, 报告 §7.9)。
+
+        与构造参数 process_noise_enabled+noise_seed 的区别: 后者用一个共享 Generator
+        按 commit 顺序消费噪声 (分支 commit 顺序不同 → 噪声不可比); 本方法把噪声改为按
+        (crn_seed, lot, ppid) 键控 —— 同一 lot 在任意分支拿到相同噪声, 实现公共随机数。
+        供 VC-MCTS rollout 分支调用 (在 clone 出的 env 上), 不影响真实在线 env。
+        """
+        self.process_noise_enabled = True
+        self._crn_seed = int(crn_seed)
+
+    def _crn_noise_rng(self, lot, ppid):
+        """按 (crn_seed, lot, ppid) 键控的独立 Generator (CRN 命门: 顺序无关)。"""
+        return np.random.default_rng(
+            (int(self._crn_seed), int(lot), int(ppid))
+        )
 
     def advance_time(self, next_time):
         """推进仿真时钟到指定时间。只能向前推进。"""
@@ -1107,12 +1129,12 @@ class ResourceCalendarEnv:
             if self.is_doomed(int(action.lot)):
                 continue
             try:
-                res = self.dry_run_action(action)
+                wafer_schedule = self._chain_mask_wafer_schedule(action)
             except Exception:
                 continue
-            if not res.success or np.asarray(res.wafer_schedule).size == 0:
+            if wafer_schedule is None or wafer_schedule.size == 0:
                 continue
-            count, _total = self.encoder.compute_q_time_violation(res.wafer_schedule)
+            count, _total = self.encoder.compute_q_time_violation(wafer_schedule)
             if float(count) > 0.0:
                 mask[i] = False
         return mask
@@ -1142,13 +1164,13 @@ class ResourceCalendarEnv:
             valid = 0
             for _ in range(k_mc):
                 try:
-                    res = self.dry_run_action(action, noise_rng=rng)
+                    wafer_schedule = self._chain_mask_wafer_schedule(action, noise_rng=rng)
                 except Exception:
                     continue
-                if not res.success or np.asarray(res.wafer_schedule).size == 0:
+                if wafer_schedule is None or wafer_schedule.size == 0:
                     continue
                 valid += 1
-                count, _total = self.encoder.compute_q_time_violation(res.wafer_schedule)
+                count, _total = self.encoder.compute_q_time_violation(wafer_schedule)
                 if float(count) > 0.0:
                     violations += 1
             if valid > 0 and (violations / valid) > threshold:
@@ -1172,7 +1194,7 @@ class ResourceCalendarEnv:
         """
         from lower_layer_estimator import estimate, is_qtime_violated_probabilistically
 
-        mask_mode = getattr(self, "qtime_mask_mode", "aggregate")
+        mask_mode = getattr(self, "qtime_mask_mode", "chain_joint")
         if mask_mode == "chain":
             return self._qtime_chain_mask(machine, candidate_actions)
         if mask_mode == "chain_joint":
@@ -2076,7 +2098,13 @@ class ResourceCalendarEnv:
             float(self.encoder.arrival_times[lot]),
         )
         if noise_rng is False:
-            rng = self._noise_rng if self.process_noise_enabled else None
+            if not self.process_noise_enabled:
+                rng = None
+            elif self._crn_seed is not None:
+                # CRN 键控: 同一 (lot, ppid) 在所有分支拿到相同噪声 (机制 3 命门)
+                rng = self._crn_noise_rng(lot, ppid)
+            else:
+                rng = self._noise_rng
         elif noise_rng is None:
             rng = None
         else:
@@ -2129,6 +2157,15 @@ class ResourceCalendarEnv:
                 float(end_time),
             )
 
+        wafer_schedule = self._assemble_wafer_schedule(lot, machine, ppid, res)
+        lot_schedule = np.asarray(
+            [[lot, machine, ppid, res.machine_interval[1], res.lot_end]],
+            dtype=float,
+        )
+        return lot_schedule, wafer_schedule, state
+
+    def _assemble_wafer_schedule(self, lot, machine, ppid, res):
+        """把 ScheduleResult 的 batch_intervals 展开成 (n,9) wafer_schedule 行。"""
         steps = self.encoder.get_process_steps(lot, machine, ppid)
         n_stages = len(steps)
         trial_rows = []
@@ -2153,13 +2190,44 @@ class ResourceCalendarEnv:
                         start_time,
                         end_time,
                     ])
+        return np.asarray(trial_rows, dtype=float)
 
-        lot_schedule = np.asarray(
-            [[lot, machine, ppid, res.machine_interval[1], res.lot_end]],
-            dtype=float,
+    def _chain_mask_wafer_schedule(self, action, noise_rng=None):
+        """chain mask 专用轻量 dry-run（优化④）。
+
+        直接走非破坏的 schedule_on_calendar 并组装 wafer_schedule 验链窗——不复制
+        ScheduleState、不往任何日历写区间（dry_run_action 每次深拷贝全状态，chain
+        mask 每候选 K 次调用时该拷贝是纯浪费）。噪声经同一 noise_rng 进同一
+        schedule_on_calendar，抽样序列与 dry_run_action 路径完全一致。
+        返回 wafer_schedule (n,9) 或 None（排程不可行 / ppid 步骤缺失）。
+        """
+        from lower_layer_scheduler import schedule_on_calendar
+
+        lot = int(action.lot)
+        machine = int(action.machine)
+        ppid = int(action.ppid)
+        try:
+            steps = self.encoder.get_process_steps(lot, machine, ppid)
+        except (KeyError, ValueError):
+            return None
+        if not steps:
+            return None
+        earliest_release = max(
+            self.current_time,
+            float(self.encoder.arrival_times[lot]),
         )
-        wafer_schedule = np.asarray(trial_rows, dtype=float)
-        return lot_schedule, wafer_schedule, state
+        res = schedule_on_calendar(
+            lot,
+            machine,
+            ppid,
+            self.encoder,
+            self.state,
+            earliest_release=earliest_release,
+            noise_rng=noise_rng,
+        )
+        if res.infeasible_reason:
+            return None
+        return self._assemble_wafer_schedule(lot, machine, ppid, res)
 
     # ---- SAS 步进 (RL 交互接口) ----
 
