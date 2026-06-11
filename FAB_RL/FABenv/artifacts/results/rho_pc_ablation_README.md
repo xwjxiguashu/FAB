@@ -48,3 +48,27 @@ Findings:
    with an upcoming high-priority lot), reserve edges hold the line at 0.
    Demonstrating the full decision-level power of mechanism 2 needs a
    capability-scarce late_hi variant (报告8 §12.2 相变扫描 structural knob).
+
+## Results (2026-06-11, late_hi_scarce, eligibility_density=0.3, PYTHONHASHSEED=0, aggregate mask, rule delegate, 2 seeds)
+
+Same deterministic FIFO baseline for all rows: O2 = 3306.3, Q-time = 18, util = 0.829.
+
+| config | VC O2 | O2% | VC Q-time | util | resv |
+|---|---:|---:|---:|---:|---:|
+| VC, mechanism 2 OFF | 2910.7 / 2874.3 (per seed) | -12.0% / -13.1% | **28 / 18** | 0.745 / 0.817 | 13 |
+| VC, mechanism 2 ON (alpha=0.6) | 2939.2 (both seeds) | -11.1% | **12** | 0.766 | 12 |
+
+Findings (the leverage-instance test 报告8 §7.12.2 性质 2 was waiting for):
+1. **OFF harms the hard constraint under capability scarcity**: blind reserve/dispatch
+   guidance pushes Q-time 18 → 28 on seed 0. ON pushes it 18 → **12** (-33% vs
+   baseline) on both seeds — lexicographically (Q-time first) ON strictly
+   dominates both OFF and FIFO: (12, 2939) < (18, 2874) < (28, 2911).
+2. The O2 cost of that hard-constraint gain is ~1.5pp of improvement
+   (-11.1% vs -12/-13%) — exactly the intended dictionary-order trade.
+3. Δρ_pc is now genuinely nonzero (delta_avg = -0.013): dispatch displacement
+   is visible on the scarce instance, unlike capability-homogeneous late_hi.
+4. ON also pins both seeds to one schedule (the deterministic ρ̂_pc tie-break),
+   removing the cross-process wobble that turned out to be the PYTHONHASHSEED
+   reproducibility bug (str-hash-order-dependent iteration somewhere in the
+   scheduling path — separate debugging task; fix the env var for all
+   multi-worker comparisons until located).
