@@ -204,6 +204,48 @@ def test_planner_populates_matching_rho_pc_fields_when_enabled(small_encoder):
     assert any(item["delta_rho_pc"] >= 0.0 for item in edge_dicts if item["kind"] == "reserve")
 
 
+def test_rollout_qtime_mask_mode_downgrades_clone_only(small_encoder, monkeypatch):
+    """优化①: rollout clone 上降级 mask 口径，真实 env 口径保持 chain_joint。"""
+    import vc_mcts_planner as planner_module
+
+    env = ResourceCalendarEnv(small_encoder, top_k=8, w_lookahead=4.0)
+    driver = _driver(env)
+    driver.reset_episode()
+    ledger = ReservationLedger()
+    assert env.qtime_mask_mode == "chain_joint"
+
+    seen_modes = []
+    original = planner_module.run_rule_episode_with_reservations
+
+    def spy(branch_driver, **kwargs):
+        seen_modes.append(branch_driver.env.qtime_mask_mode)
+        return original(branch_driver, **kwargs)
+
+    monkeypatch.setattr(planner_module, "run_rule_episode_with_reservations", spy)
+
+    planner = VCMCTSPlanner(
+        VCMCTSConfig(
+            n_iter=1,
+            top_k_dispatch=1,
+            top_b_reserve=0,
+            rollout_max_steps=5,
+            rollout_qtime_mask_mode="aggregate",
+        )
+    )
+    planner.plan(driver, ledger, machine=1)
+
+    assert seen_modes and all(mode == "aggregate" for mode in seen_modes)
+    assert env.qtime_mask_mode == "chain_joint"
+
+    # 默认 None → clone 口径与真实 env 相同 (行为不变)
+    seen_modes.clear()
+    default_planner = VCMCTSPlanner(
+        VCMCTSConfig(n_iter=1, top_k_dispatch=1, top_b_reserve=0, rollout_max_steps=5)
+    )
+    default_planner.plan(driver, ledger, machine=1)
+    assert seen_modes and all(mode == "chain_joint" for mode in seen_modes)
+
+
 def _scored_edge(kind, o2, rho_pc_after, prior=1.0):
     from vc_mcts_planner import VCMCTSAction, VCMCTSEdgeStats
 

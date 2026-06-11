@@ -117,6 +117,7 @@ def run_seed(
     rho_pc_alpha=1.0,
     rho_pc_priority_threshold=None,
     qtime_mask_mode=None,
+    rollout_qtime_mask_mode=None,
 ):
     factory = _encoder_factory(instance)
 
@@ -209,6 +210,7 @@ def run_seed(
             rho_pc_weight=rho_pc_weight,
             rho_pc_alpha=rho_pc_alpha,
             rho_pc_priority_threshold=rho_pc_priority_threshold,
+            rollout_qtime_mask_mode=rollout_qtime_mask_mode,
         ),
         dispatch_delegate=delegate,
         prior_provider=prior_provider,
@@ -308,6 +310,7 @@ def _run_seed_job(args):
         rho_pc_alpha,
         rho_pc_priority_threshold,
         qtime_mask_mode,
+        rollout_qtime_mask_mode,
     ) = args
     t0 = time.time()
     row = run_seed(
@@ -342,6 +345,7 @@ def _run_seed_job(args):
         rho_pc_alpha=rho_pc_alpha,
         rho_pc_priority_threshold=rho_pc_priority_threshold,
         qtime_mask_mode=qtime_mask_mode,
+        rollout_qtime_mask_mode=rollout_qtime_mask_mode,
     )
     row["_elapsed_s"] = time.time() - t0
     return row
@@ -395,6 +399,7 @@ def main(
     rho_pc_alpha=1.0,
     rho_pc_priority_threshold=None,
     qtime_mask_mode=None,
+    rollout_qtime_mask_mode=None,
 ):
     n = int(seeds)
     workers = max(1, int(workers))
@@ -444,6 +449,7 @@ def main(
                 rho_pc_alpha,
                 rho_pc_priority_threshold,
                 qtime_mask_mode,
+                rollout_qtime_mask_mode,
             )
         )
 
@@ -545,6 +551,12 @@ def _cli():
         default=None,
         help="覆盖环境默认 qtime mask 口径 (chain_joint 较精确但慢 ~8x; 缺省不覆盖)",
     )
+    parser.add_argument(
+        "--rollout-qtime-mask-mode",
+        choices=["aggregate", "chain", "chain_joint"],
+        default=None,
+        help="优化①: 仅 VC-MCTS rollout clone 上的 mask 口径 (真实决策/commit 不变)",
+    )
     args = parser.parse_args()
     main(
         instance=args.instance,
@@ -579,6 +591,7 @@ def _cli():
         rho_pc_alpha=args.rho_pc_alpha,
         rho_pc_priority_threshold=args.rho_pc_priority_threshold,
         qtime_mask_mode=args.qtime_mask_mode,
+        rollout_qtime_mask_mode=args.rollout_qtime_mask_mode,
     )
 
 

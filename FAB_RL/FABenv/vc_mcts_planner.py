@@ -48,6 +48,11 @@ class VCMCTSConfig:
     crn_noise: bool = False
     n_mc: int = 1
     crn_seed_base: int = 0
+    # 优化① (2026-06-11): rollout clone 上的 qtime mask 口径覆盖。None (默认) =
+    # 与真实 env 相同 (行为不变)。设为 "aggregate" 时只降级搜索估值用的 rollout
+    # (~8-9x 提速)，真实决策池与 commit 准入仍走 env 自身口径 (chain_joint)，
+    # 硬约束防线不受影响；所有边共享同一降级偏差，字典序比较中近似抵消。
+    rollout_qtime_mask_mode: str | None = None
     # 机制 2 (报告8 §7.12): 优先级-能力对冲水位 ρ_pc (二部匹配裕量)。use_rho_pc=True
     # 时每条 root 边算 ρ̃_pc(s⊕a) 的 before/after/delta，并把 UCT exploitation 换成
     # α·q̂ + (1−α)·ρ̂_pc 插值 (rho_pc_alpha=1.0 即纯 q̂，等价旧行为作消融基线)；
@@ -543,6 +548,8 @@ class VCMCTSPlanner:
     def _evaluate_action_once(self, driver, ledger, action, noise_seed=None):
         branch_driver = clone_driver_for_rollout(driver)
         branch_ledger = clone_ledger_for_rollout(ledger)
+        if self.config.rollout_qtime_mask_mode:
+            branch_driver.env.qtime_mask_mode = str(self.config.rollout_qtime_mask_mode)
         if noise_seed is not None:
             branch_driver.env.enable_process_noise(noise_seed)
         self._apply_action(branch_driver, branch_ledger, action)
