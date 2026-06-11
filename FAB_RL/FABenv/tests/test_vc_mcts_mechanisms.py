@@ -204,6 +204,74 @@ def test_planner_populates_matching_rho_pc_fields_when_enabled(small_encoder):
     assert any(item["delta_rho_pc"] >= 0.0 for item in edge_dicts if item["kind"] == "reserve")
 
 
+def test_plan_uses_per_visit_scenarios_with_crn(small_encoder, monkeypatch):
+    """机制三组件一 (报告8 §7.13.2): 边的第 k 次访问用场景 ξ_k, 各边按访问序共享场景库。
+
+    旧语义 (每次评估固定同一组种子取均值) 下重复访问返回同一个数, 访问分配
+    不影响估值 → 机制二无决策通道。新语义: visit k → noise_seed = base + (k % n_mc)。
+    """
+    env = ResourceCalendarEnv(small_encoder, top_k=8, w_lookahead=4.0)
+    driver = _driver(env)
+    driver.reset_episode()
+    ledger = ReservationLedger()
+
+    planner = VCMCTSPlanner(
+        VCMCTSConfig(
+            n_iter=8,
+            top_k_dispatch=1,
+            top_b_reserve=1,
+            crn_noise=True,
+            n_mc=4,
+            crn_seed_base=100,
+            rollout_max_steps=10,
+        )
+    )
+
+    seen = []  # (action kind, lot/future_lot, noise_seed) 评估序列
+    original = planner._evaluate_action_once
+
+    def spy(driver_, ledger_, action, noise_seed=None):
+        seen.append((action.kind, action.lot, action.future_lot, noise_seed))
+        return original(driver_, ledger_, action, noise_seed=noise_seed)
+
+    monkeypatch.setattr(planner, "_evaluate_action_once", spy)
+    planner.plan(driver, ledger, machine=1)
+
+    assert seen
+    # 每条评估恰好一条 rollout (非一次评估内部跑 n_mc 条)
+    assert len(seen) == max(3, 8)  # iteration_count = max(len(edges), n_iter)
+
+    # 同一条边的第 k 次访问 → 种子 100 + (k % 4); 不同边的第 0 次访问共享种子 100 (CRN 配对)
+    per_edge = {}
+    for kind, lot, future_lot, seed in seen:
+        per_edge.setdefault((kind, lot, future_lot), []).append(seed)
+    for seeds in per_edge.values():
+        assert seeds == [100 + (k % 4) for k in range(len(seeds))]
+    first_visit_seeds = {seeds[0] for seeds in per_edge.values()}
+    assert first_visit_seeds == {100}
+
+
+def test_per_visit_scenario_plan_is_reproducible(small_encoder):
+    """逐访问场景下 plan() 仍完全可复现 (同配置两次 → 边统计一致)。"""
+    def run_once():
+        env = ResourceCalendarEnv(small_encoder, top_k=8, w_lookahead=4.0)
+        driver = _driver(env)
+        driver.reset_episode()
+        planner = VCMCTSPlanner(
+            VCMCTSConfig(
+                n_iter=8, top_k_dispatch=1, top_b_reserve=1,
+                crn_noise=True, n_mc=4, crn_seed_base=100, rollout_max_steps=10,
+            )
+        )
+        trace = planner.plan(driver, ReservationLedger(), machine=1)
+        return [
+            (e.action.kind, e.visits, round(e.total_o2, 9), round(e.total_qtime, 9))
+            for e in trace.edge_stats
+        ]
+
+    assert run_once() == run_once()
+
+
 def test_rollout_qtime_mask_mode_downgrades_clone_only(small_encoder, monkeypatch):
     """优化①: rollout clone 上降级 mask 口径，真实 env 口径保持 chain_joint。"""
     import vc_mcts_planner as planner_module

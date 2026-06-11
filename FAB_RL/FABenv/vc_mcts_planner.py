@@ -294,7 +294,12 @@ class VCMCTSPlanner:
         iteration_count = max(len(edges), int(self.config.n_iter))
         for _ in range(iteration_count):
             edge = self._select_edge(edges)
-            objective = self.evaluate_action(driver, ledger, edge.action)
+            # 机制三组件一 (报告8 §7.13.2): 边的第 k 次访问评估场景 ξ_k (scenario =
+            # 当前访问数), 各边按访问序共享同一场景库 → CRN 配对; 均值随访问累积,
+            # UCT 的访问分配因此成为"评估精度预算" (机制二的决策通道由此打开)。
+            objective = self.evaluate_action(
+                driver, ledger, edge.action, scenario=edge.visits
+            )
             edge.record(objective)
         selected = self._choose_final_action(edges, current_time)
         return VCMCTSDecisionTrace(
@@ -527,16 +532,23 @@ class VCMCTSPlanner:
             for action, prior in zip(actions, raw_priors)
         ]
 
-    def evaluate_action(self, driver, ledger, action):
+    def evaluate_action(self, driver, ledger, action, scenario=None):
         if self.rollout_evaluator is not None:
             return self.rollout_evaluator(driver, ledger, action, self.config)
 
         if not self.config.crn_noise or int(self.config.n_mc) <= 1:
             return self._evaluate_action_once(driver, ledger, action, noise_seed=None)
 
-        # 机制 3 (报告 §7.9): N_mc 条带噪 rollout 取均值 Ê[obj]。同一节点下所有候选边
-        # 复用同一组种子 crn_seed_base + k，公共随机数在比较时相减抵消 → 比的是动作差异
-        # 而非噪声。小 n_mc (3–8) 即可给出稳定排序。
+        if scenario is not None:
+            # 逐访问场景 (plan() 主循环路径, 报告8 §7.13.2): 第 k 次访问 → 场景
+            # ξ_(k mod n_mc), 种子 crn_seed_base + (k mod n_mc)。同访问序的不同边
+            # 共享同一场景 (CRN 配对, 公共噪声在比较时相消)。
+            seed = int(self.config.crn_seed_base) + int(scenario) % max(
+                1, int(self.config.n_mc)
+            )
+            return self._evaluate_action_once(driver, ledger, action, noise_seed=seed)
+
+        # scenario=None (独立单次调用, 旧 API): 整个场景库取均值 Ê[obj]。
         samples = []
         for k in range(int(self.config.n_mc)):
             seed = int(self.config.crn_seed_base) + k
