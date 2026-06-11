@@ -415,6 +415,7 @@ def build_pressure_test_encoder(
     arrival_mean_gap=0.6,
     priority_mode="random",
     priority_arrival_corr=0.97,
+    eligibility_density=1.0,
 ):
     """构建 50 Lot × 10 机台的压力测试实例。
 
@@ -455,17 +456,32 @@ def build_pressure_test_encoder(
         for lot in range(1, num_lots + 1)
     }
 
-    # 所有 Lot 在所有机台上均可加工 (完全柔性)
-    feasible_machines = {
-        lot: list(range(1, num_machines + 1))
-        for lot in range(1, num_lots + 1)
-    }
+    # 机台资格 (异型柔性, 报告8 §12.2 能力稀缺度旋钮):
+    #   eligibility_density=1.0 (默认) → 所有 Lot 在所有机台上均可加工 (完全柔性, 旧行为);
+    #   <1.0 → 每个 Lot 只能在 round(density*num_machines) 台随机机台上加工 (身份预留
+    #   才有杠杆的结构前提)。资格抽样用独立 rng 流, 不消耗主 rng → density=1.0 时
+    #   实例与历史版本逐位一致。
+    if float(eligibility_density) >= 1.0:
+        feasible_machines = {
+            lot: list(range(1, num_machines + 1))
+            for lot in range(1, num_lots + 1)
+        }
+    else:
+        k = max(1, int(round(float(eligibility_density) * num_machines)))
+        eligibility_rng = np.random.default_rng(int(seed) + 777_000)
+        feasible_machines = {
+            lot: sorted(
+                int(m) + 1
+                for m in eligibility_rng.choice(num_machines, size=k, replace=False)
+            )
+            for lot in range(1, num_lots + 1)
+        }
 
     feasible_ppids = {}
     ppid_steps = {}
 
     for lot in range(1, num_lots + 1):
-        for machine in range(1, num_machines + 1):
+        for machine in feasible_machines[lot]:
             # PPID 编号: lot*10000 + machine*100 + ppid_index
             ppids = [
                 lot * 10000 + machine * 100 + ppid_index
@@ -551,7 +567,7 @@ def build_pressure_test_encoder(
     encoder.q_time_limits = {
         (lot, machine, ppid, from_stage, to_stage): float(qtime_limit)
         for lot in range(1, num_lots + 1)
-        for machine in range(1, num_machines + 1)
+        for machine in feasible_machines[lot]
         for ppid in feasible_ppids[(lot, machine)]
         for (from_stage, to_stage) in ((1, 2), (2, 3))
     }
@@ -609,6 +625,30 @@ def build_late_hi_encoder(
         arrival_mean_gap=arrival_mean_gap,
         priority_mode="late_hi",
         priority_arrival_corr=priority_arrival_corr,
+    )
+
+
+def build_late_hi_scarce_encoder(
+    seed=2026,
+    qtime_limit=3.0,
+    arrival_mean_gap=0.6,
+    priority_arrival_corr=0.97,
+    eligibility_density=0.3,
+):
+    """能力稀缺版 late_hi (报告8 §12.2): 高优先级晚到 × 机台资格稀疏。
+
+    每个 Lot 只能在 round(density*10) 台机台上加工 (部分工件只能在部分机器上
+    加工的异型并行机结构, 对应 FJSP 基准集 Brandimarte/Hurink 的部分柔性设定)。
+    这是机制 2 (ρ_pc 二部匹配对冲水位) 杠杆条件成立的实例: "晚到高优先级 +
+    兼容机台稀缺 + 当前派工挤占未来" 三者同时存在 (§7.12.2 性质 2)。
+    """
+    return build_pressure_test_encoder(
+        seed=seed,
+        qtime_limit=qtime_limit,
+        arrival_mean_gap=arrival_mean_gap,
+        priority_mode="late_hi",
+        priority_arrival_corr=priority_arrival_corr,
+        eligibility_density=eligibility_density,
     )
 
 

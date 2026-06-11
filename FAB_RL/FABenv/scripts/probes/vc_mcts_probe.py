@@ -484,7 +484,11 @@ def main(
 
 def _cli():
     parser = argparse.ArgumentParser(description="VC-MCTS online reservation probe")
-    parser.add_argument("--instance", choices=["small", "pressure", "late_hi"], default="small")
+    parser.add_argument(
+        "--instance",
+        choices=["small", "pressure", "late_hi", "late_hi_scarce"],
+        default="small",
+    )
     parser.add_argument("--seeds", type=int, default=1)
     parser.add_argument(
         "--strategy",
