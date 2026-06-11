@@ -814,11 +814,20 @@ class ResourceCalendarEnv:
         # ① qtime-safe mask（报告 Section 3.2，仅过滤真实候选）
         qtime_mask_enabled = getattr(self.encoder, "z_eps", None) is not None
         if qtime_mask_enabled and real_candidates:
-            candidate_actions_for_mask = [c.action for c in real_candidates]
-            qtime_masks = self.qtime_safe_mask(machine, candidate_actions_for_mask)
-            real_candidates = [
-                c for c, ok in zip(real_candidates, qtime_masks) if ok
-            ]
+            mask_mode = getattr(self, "qtime_mask_mode", "chain_joint")
+            if (
+                bool(getattr(self, "qtime_mask_prescreen", False))
+                and mask_mode in ("chain", "chain_joint")
+            ):
+                real_candidates = self._prescreened_qtime_safe_candidates(
+                    machine, real_candidates, pool_size,
+                )
+            else:
+                candidate_actions_for_mask = [c.action for c in real_candidates]
+                qtime_masks = self.qtime_safe_mask(machine, candidate_actions_for_mask)
+                real_candidates = [
+                    c for c, ok in zip(real_candidates, qtime_masks) if ok
+                ]
 
         # ② priority filter（报告 §3.1/§3.4，仅 strict 模式实际删减）
         if self.priority_filter_mode == "strict" and real_candidates:
@@ -884,6 +893,40 @@ class ResourceCalendarEnv:
             invalid_reasons=invalid_reasons,
             no_action_available=(len(real_candidates) == 0),
         )
+
+    def _prescreened_qtime_safe_candidates(self, machine, real_candidates, pool_size):
+        """两段式 qtime mask（优化③，opt-in `qtime_mask_prescreen`）。
+
+        第一段用便宜的 aggregate 口径粗筛全量候选；第二段只对粗筛存活集中按
+        score 排序的前 `pool_size + qtime_prescreen_margin` 个跑昂贵的 chain 口径。
+        边界效应：排在裕量之外、本可能 chain-safe 的候选不进池（裕量越大偏差越小，
+        裕量 ≥ 候选数时与全量 chain mask 完全等价——由等价性测试锁定）。doomed
+        排除在两段 mask 内部各自保持，防死锁逻辑不变。
+        """
+        actions = [c.action for c in real_candidates]
+        saved_mode = self.qtime_mask_mode
+        try:
+            self.qtime_mask_mode = "aggregate"
+            coarse_mask = self.qtime_safe_mask(machine, actions)
+        finally:
+            self.qtime_mask_mode = saved_mode
+        survivors = [c for c, ok in zip(real_candidates, coarse_mask) if ok]
+        if not survivors:
+            return survivors
+
+        margin = int(getattr(self, "qtime_prescreen_margin", pool_size))
+        limit = int(pool_size) + max(0, margin)
+        survivors.sort(
+            key=lambda candidate: (
+                -candidate.score,
+                candidate.action.lot,
+                candidate.action.machine,
+                candidate.action.ppid,
+            )
+        )
+        head = survivors[:limit]
+        chain_mask = self.qtime_safe_mask(machine, [c.action for c in head])
+        return [c for c, ok in zip(head, chain_mask) if ok]
 
     def _apply_candidate_rank_features(self, actions, feature_rows, mask):
         """为候选特征矩阵填充排名相关特征。
